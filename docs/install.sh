@@ -38,7 +38,7 @@ download_and_verify() {
     base_url="https://github.com/${REPO}/releases/download/${version}"
     tarball="${BINARY}-${version}-${target}.tar.gz"
 
-    echo "Downloading ${tarball}..."
+    echo "Downloading ${tarball}..." >&2
     if command -v curl >/dev/null 2>&1; then
         curl -sSfL -o "${tmpdir}/${tarball}" "${base_url}/${tarball}"
         curl -sSfL -o "${tmpdir}/checksums.txt" "${base_url}/checksums.txt"
@@ -47,7 +47,7 @@ download_and_verify() {
         wget -q -O "${tmpdir}/checksums.txt" "${base_url}/checksums.txt"
     fi
 
-    echo "Verifying checksum..."
+    echo "Verifying checksum..." >&2
     cd "$tmpdir"
     grep "$tarball" checksums.txt | sha256sum -c - >/dev/null 2>&1
     cd - >/dev/null
