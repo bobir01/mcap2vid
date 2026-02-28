@@ -2,6 +2,10 @@
 
 High-performance MCAP to MP4 video extractor with embedded ROS2 timestamp preservation.
 
+```bash
+curl -sSfL https://bobir01.github.io/mcap2vid/install.sh | sh
+```
+
 ## Features
 
 - Extract video from MCAP recordings to MP4
