@@ -1,0 +1,27 @@
+[package]
+name = "mcap2vid"
+version = "0.1.0"
+edition = "2021"
+description = "Extract video from MCAP recordings with embedded ROS2 timestamps"
+license = "MIT"
+repository = "https://github.com/bobir01/mcap2vid"
+keywords = ["mcap", "ros2", "video", "robotics", "ffmpeg"]
+categories = ["command-line-utilities", "multimedia::video"]
+readme = "README.md"
+
+[dependencies]
+mcap = "0.9"
+clap = { version = "4", features = ["derive"] }
+rayon = "1.10"
+memmap2 = "0.9"
+image = "0.25"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+indicatif = "0.17"
+byteorder = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
