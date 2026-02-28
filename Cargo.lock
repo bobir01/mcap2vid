@@ -760,7 +760,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcap_export-rs"
+name = "mcap2vid"
 version = "0.1.0"
 dependencies = [
  "anyhow",
