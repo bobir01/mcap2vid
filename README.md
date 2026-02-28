@@ -17,9 +17,19 @@ High-performance MCAP to MP4 video extractor with embedded ROS2 timestamp preser
 
 ## Installation
 
+**Quick install** (Linux x86_64/aarch64):
+
+```bash
+curl -sSfL https://bobir01.github.io/mcap2vid/install.sh | sh
+```
+
+**Via Cargo:**
+
 ```bash
 cargo install mcap2vid
 ```
+
+Pre-built binaries are also available on the [GitHub Releases](https://github.com/bobir01/mcap2vid/releases) page.
 
 ## Usage
 
