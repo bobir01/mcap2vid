@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Result};
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use crate::decoder::DecodedFrame;
 
@@ -19,9 +21,12 @@ pub struct EncoderConfig {
 /// FFmpeg video encoder using subprocess
 pub struct FfmpegEncoder {
     child: Child,
+    stdin_writer: Option<BufWriter<std::process::ChildStdin>>,
     config: EncoderConfig,
     expected_frame_size: usize,
     frames_written: usize,
+    stderr_buf: Arc<Mutex<Vec<u8>>>,
+    stderr_thread: Option<JoinHandle<()>>,
 }
 
 impl FfmpegEncoder {
@@ -56,19 +61,55 @@ impl FfmpegEncoder {
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
 
-        let child = cmd.spawn().map_err(|e| {
+        let mut child = cmd.spawn().map_err(|e| {
             anyhow!(
                 "Failed to start FFmpeg. Is it installed? Error: {}",
                 e
             )
         })?;
 
+        let stdin_writer = BufWriter::new(child.stdin.take().unwrap());
+        let (stderr_buf, stderr_thread) = Self::spawn_stderr_drain(&mut child);
+
         Ok(Self {
             child,
+            stdin_writer: Some(stdin_writer),
             config,
             expected_frame_size,
             frames_written: 0,
+            stderr_buf,
+            stderr_thread: Some(stderr_thread),
         })
+    }
+
+    /// Spawn a background thread that continuously drains FFmpeg's stderr
+    /// to prevent pipe buffer deadlock.
+    fn spawn_stderr_drain(child: &mut Child) -> (Arc<Mutex<Vec<u8>>>, JoinHandle<()>) {
+        let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+        let buf_clone = Arc::clone(&stderr_buf);
+        let mut stderr = child.stderr.take().expect("stderr was piped");
+
+        let handle = thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop {
+                match stderr.read(&mut tmp) {
+                    Ok(0) => break, // EOF — FFmpeg exited
+                    Ok(n) => {
+                        if let Ok(mut buf) = buf_clone.lock() {
+                            // Keep only the last 64KB to bound memory
+                            if buf.len() + n > 65536 {
+                                let drain = buf.len() + n - 65536;
+                                buf.drain(..drain);
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (stderr_buf, handle)
     }
 
     /// Write a decoded frame to FFmpeg
@@ -87,20 +128,19 @@ impl FfmpegEncoder {
             ));
         }
 
-        let stdin = self
-            .child
-            .stdin
+        let writer = self
+            .stdin_writer
             .as_mut()
             .ok_or_else(|| anyhow!("FFmpeg stdin not available"))?;
 
-        match stdin.write_all(&frame.rgb_data) {
+        match writer.write_all(&frame.rgb_data) {
             Ok(()) => {
                 self.frames_written += 1;
                 Ok(())
             }
             Err(e) => {
-                // Try to get FFmpeg's error output
-                let stderr_msg = self.try_read_stderr();
+                // Read captured stderr from drain thread
+                let stderr_msg = self.get_stderr();
                 Err(anyhow!(
                     "Failed to write frame {} to FFmpeg: {}. FFmpeg stderr: {}",
                     self.frames_written,
@@ -111,18 +151,11 @@ impl FfmpegEncoder {
         }
     }
 
-    /// Try to read any available stderr from FFmpeg
-    fn try_read_stderr(&mut self) -> String {
-        if let Some(stderr) = self.child.stderr.as_mut() {
-            let mut buf = vec![0u8; 4096];
-            match stderr.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    String::from_utf8_lossy(&buf[..n]).to_string()
-                }
-                _ => "No stderr available".to_string(),
-            }
-        } else {
-            "Stderr not captured".to_string()
+    /// Get captured stderr output from the drain thread
+    fn get_stderr(&self) -> String {
+        match self.stderr_buf.lock() {
+            Ok(buf) if !buf.is_empty() => String::from_utf8_lossy(&buf).to_string(),
+            _ => "No stderr available".to_string(),
         }
     }
 
@@ -158,30 +191,43 @@ impl FfmpegEncoder {
         cmd.stdout(Stdio::inherit()); // FFmpeg stdout → process stdout (the video stream)
         cmd.stderr(Stdio::piped());
 
-        let child = cmd.spawn().map_err(|e| {
+        let mut child = cmd.spawn().map_err(|e| {
             anyhow!(
                 "Failed to start FFmpeg. Is it installed? Error: {}",
                 e
             )
         })?;
 
+        let stdin_writer = BufWriter::new(child.stdin.take().unwrap());
+        let (stderr_buf, stderr_thread) = Self::spawn_stderr_drain(&mut child);
+
         Ok(Self {
             child,
+            stdin_writer: Some(stdin_writer),
             config,
             expected_frame_size,
             frames_written: 0,
+            stderr_buf,
+            stderr_thread: Some(stderr_thread),
         })
     }
 
     /// Finish encoding and wait for FFmpeg to complete
     pub fn finish(mut self) -> Result<()> {
-        // Close stdin to signal end of input
-        drop(self.child.stdin.take());
+        // Flush buffered writes, then close stdin to signal end of input
+        if let Some(writer) = self.stdin_writer.take() {
+            drop(writer);
+        }
 
-        let output = self.child.wait_with_output()?;
+        let status = self.child.wait()?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        // Join the stderr drain thread so we have the full output
+        if let Some(handle) = self.stderr_thread.take() {
+            let _ = handle.join();
+        }
+
+        if !status.success() {
+            let stderr = self.get_stderr();
             return Err(anyhow!("FFmpeg encoding failed: {}", stderr));
         }
 
