@@ -1,6 +1,6 @@
 [package]
 name = "mcap2vid"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Extract video from MCAP recordings with embedded ROS2 timestamps"
 license = "MIT"
