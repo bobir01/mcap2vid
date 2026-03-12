@@ -249,6 +249,53 @@ pub fn parse_compressed_image(data: &[u8]) -> Result<CompressedImage> {
     })
 }
 
+/// Parse timestamp from a ROS2 message whose first field is std_msgs/Header.
+/// This reads only the CDR encapsulation + stamp fields and avoids decoding payload bytes.
+pub fn parse_header_timestamp(data: &[u8]) -> Result<f64> {
+    // 4-byte CDR encapsulation + 8-byte stamp(sec + nanosec)
+    if data.len() < 12 {
+        return Err(anyhow!("Data too short for CDR header timestamp"));
+    }
+
+    let sec = i32::from_le_bytes(
+        data[4..8]
+            .try_into()
+            .map_err(|_| anyhow!("Invalid CDR sec field"))?,
+    );
+    let nanosec = u32::from_le_bytes(
+        data[8..12]
+            .try_into()
+            .map_err(|_| anyhow!("Invalid CDR nanosec field"))?,
+    );
+
+    Ok(Time { sec, nanosec }.to_unix_timestamp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_header_timestamp;
+
+    #[test]
+    fn parse_header_timestamp_reads_stamp_fields() {
+        let sec: i32 = 123;
+        let nanosec: u32 = 456_000_000;
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]); // CDR encapsulation
+        data.extend_from_slice(&sec.to_le_bytes());
+        data.extend_from_slice(&nanosec.to_le_bytes());
+        data.extend_from_slice(&[0, 0, 0, 0]); // extra bytes should be ignored
+
+        let ts = parse_header_timestamp(&data).unwrap();
+        assert!((ts - 123.456).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_header_timestamp_rejects_short_data() {
+        let err = parse_header_timestamp(&[0u8; 11]).unwrap_err();
+        assert!(err.to_string().contains("Data too short"));
+    }
+}
+
 /// Read a fixed-size f64 array from CDR data
 fn read_cdr_f64_array<const N: usize>(cursor: &mut Cursor<&[u8]>) -> Result<[f64; N]> {
     align_to(cursor, 8); // f64 requires 8-byte alignment

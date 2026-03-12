@@ -226,8 +226,7 @@ fn export_video(
         log.log(&format!("Found {} frames", total));
 
         fps = if scan.count >= 2 {
-            let duration_s =
-                (scan.last_log_time_ns - scan.first_log_time_ns) as f64 / 1_000_000_000.0;
+            let duration_s = scan.last_timestamp - scan.first_timestamp;
             if duration_s > 0.0 {
                 ((scan.count - 1) as f64 / duration_s).clamp(1.0, 120.0)
             } else {
