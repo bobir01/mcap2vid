@@ -5,8 +5,8 @@ use std::fs::File;
 use std::path::Path;
 
 use crate::ros2_msgs::{
-    parse_camera_info, parse_compressed_image, parse_image, parse_tf_message, CameraInfo,
-    ImageMessageType, MetadataMessageType, TFMessage,
+    parse_camera_info, parse_compressed_image, parse_header_timestamp, parse_image,
+    parse_tf_message, CameraInfo, ImageMessageType, MetadataMessageType, TFMessage,
 };
 
 /// Information about a video topic in an MCAP file
@@ -51,11 +51,12 @@ pub enum FrameData {
     },
 }
 
-/// Frame count and time range from a quick topic scan (no payload parsing)
+/// Frame count and timestamp range from a quick topic scan.
+/// Only parses the `header.stamp` fields; does not decode image payload bytes.
 pub struct FrameScanInfo {
     pub count: usize,
-    pub first_log_time_ns: u64,
-    pub last_log_time_ns: u64,
+    pub first_timestamp: f64,
+    pub last_timestamp: f64,
 }
 
 /// Backing storage for MCAP data — either memory-mapped or in-memory
@@ -215,20 +216,40 @@ impl McapReader {
         Ok(frames)
     }
 
-    /// Quick scan: count matching frames and get time range.
-    /// Does NOT parse CDR payloads — only checks topic and records log_time.
+    /// Quick scan: count matching frames and get `header.stamp` time range.
+    /// Does NOT decode image payload bytes.
     pub fn scan_topic(&self, topic: &str) -> Result<FrameScanInfo> {
         let mut count = 0usize;
-        let mut first_ts = u64::MAX;
-        let mut last_ts = 0u64;
+        let mut first_ts = f64::INFINITY;
+        let mut last_ts = f64::NEG_INFINITY;
+        let mut schema_checked = false;
 
         for record in mcap::MessageStream::new(self.data.as_ref())? {
             if let Ok(msg) = record {
                 if msg.channel.topic != topic {
                     continue;
                 }
+
+                if !schema_checked {
+                    let schema_name = msg
+                        .channel
+                        .schema
+                        .as_ref()
+                        .map(|s| s.name.as_str())
+                        .unwrap_or("");
+                    let is_image_topic = ImageMessageType::from_schema_name(schema_name).is_some();
+                    if !is_image_topic {
+                        return Err(anyhow!(
+                            "Topic '{}' does not contain image messages (schema: {})",
+                            topic,
+                            schema_name
+                        ));
+                    }
+                    schema_checked = true;
+                }
+
+                let t = parse_header_timestamp(&msg.data)?;
                 count += 1;
-                let t = msg.log_time;
                 if t < first_ts {
                     first_ts = t;
                 }
@@ -244,8 +265,8 @@ impl McapReader {
 
         Ok(FrameScanInfo {
             count,
-            first_log_time_ns: first_ts,
-            last_log_time_ns: last_ts,
+            first_timestamp: first_ts,
+            last_timestamp: last_ts,
         })
     }
 
