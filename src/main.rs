@@ -178,59 +178,81 @@ fn export_video(
         num_threads
     ));
 
-    // Extract compressed frames (small in memory — just JPEG/PNG blobs)
-    let frames: Vec<VideoFrame> = if is_s3_url(input) {
+    // Phase 1: Get video properties + prepare frame source.
+    // S3: all compressed frames loaded (selective by chunk).
+    // Local: only scan metadata — frames streamed in batches later.
+    enum FrameSource {
+        S3(Vec<VideoFrame>),
+        Local(McapReader),
+    }
+
+    let (source, total, fps, width, height);
+
+    if is_s3_url(input) {
         log.log(&format!("Reading from S3: {}", input));
         let s3_url = S3Url::parse(input)?;
         let client = S3Client::from_env()?;
-        client.extract_frames(&s3_url, topic)?
+        let frames = client.extract_frames(&s3_url, topic)?;
+
+        if frames.is_empty() {
+            anyhow::bail!("No frames found for topic '{}'", topic);
+        }
+
+        let first_decoded = decode_frame(&frames[0])?;
+        width = first_decoded.width;
+        height = first_decoded.height;
+        drop(first_decoded);
+
+        total = frames.len();
+        fps = if frames.len() >= 2 {
+            let duration = frames.last().unwrap().timestamp - frames[0].timestamp;
+            if duration > 0.0 {
+                ((frames.len() - 1) as f64 / duration).clamp(1.0, 120.0)
+            } else {
+                30.0
+            }
+        } else {
+            30.0
+        };
+
+        source = FrameSource::S3(frames);
     } else {
         log.log(&format!("Opening MCAP: {}", input));
         let reader = McapReader::open(Path::new(input))?;
 
-        log.log(&format!("Extracting frames from topic: {}", topic));
-        let pb = log.spinner();
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.green} {msg}")
-                .unwrap(),
-        );
-        pb.set_message("Reading MCAP messages...");
+        log.log(&format!("Scanning topic: {}", topic));
+        let scan = reader.scan_topic(topic)?;
+        total = scan.count;
+        log.log(&format!("Found {} frames", total));
 
-        let frames = reader.extract_frames(topic)?;
-        pb.finish_with_message(format!("Found {} frames", frames.len()));
-        frames
-    };
-
-    if frames.is_empty() {
-        anyhow::bail!("No frames found for topic '{}'", topic);
-    }
-
-    // Decode first frame to get dimensions
-    let first_decoded = decode_frame(&frames[0])?;
-    let (width, height) = (first_decoded.width, first_decoded.height);
-    drop(first_decoded);
-
-    // Calculate FPS from compressed frame timestamps (no full decode needed)
-    let fps = if frames.len() >= 2 {
-        let duration = frames.last().unwrap().timestamp - frames[0].timestamp;
-        if duration > 0.0 {
-            ((frames.len() - 1) as f64 / duration).clamp(1.0, 120.0)
+        fps = if scan.count >= 2 {
+            let duration_s =
+                (scan.last_log_time_ns - scan.first_log_time_ns) as f64 / 1_000_000_000.0;
+            if duration_s > 0.0 {
+                ((scan.count - 1) as f64 / duration_s).clamp(1.0, 120.0)
+            } else {
+                30.0
+            }
         } else {
             30.0
-        }
-    } else {
-        30.0
-    };
+        };
+
+        let first_frame = reader.extract_first_frame(topic)?;
+        let first_decoded = decode_frame(&first_frame)?;
+        width = first_decoded.width;
+        height = first_decoded.height;
+        drop(first_decoded);
+        drop(first_frame);
+
+        source = FrameSource::Local(reader);
+    }
 
     log.log(&format!(
         "Video: {}x{} @ {:.2} FPS, {} frames",
-        width,
-        height,
-        fps,
-        frames.len()
+        width, height, fps, total
     ));
 
+    // Phase 2: Setup encoder
     let config = EncoderConfig {
         width,
         height,
@@ -240,7 +262,6 @@ fn export_video(
         threads,
     };
 
-    // Resolve output path (for file output)
     let output_path = if !to_stdout {
         Some(if let Some(sfx) = suffix {
             let p = PathBuf::from(output);
@@ -257,7 +278,6 @@ fn export_video(
         None
     };
 
-    // Start encoder
     let mut encoder = if to_stdout {
         log.log(&format!(
             "Encoding to H.264 (preset: {}, CRF: {}) -> stdout",
@@ -272,9 +292,6 @@ fn export_video(
         FfmpegEncoder::new(output_path.as_ref().unwrap(), config)?
     };
 
-    // Batched decode + encode: decode BATCH_SIZE frames at a time, write to FFmpeg, free memory.
-    // At 1080p (~6 MB/frame), 500 frames ≈ 3 GB peak decoded memory.
-    let total = frames.len();
     let num_batches = (total + BATCH_SIZE - 1) / BATCH_SIZE;
     log.log(&format!(
         "Processing {} frames in {} batches of {}...",
@@ -293,20 +310,37 @@ fn export_video(
 
     let mut timestamps = Vec::with_capacity(total);
 
-    for batch in frames.chunks(BATCH_SIZE) {
-        let decoded = decode_frames_parallel(batch)?;
-        for frame in &decoded {
-            encoder.write_frame(frame)?;
-            timestamps.push(frame.timestamp);
-            pb.inc(1);
+    // Phase 3: Batched decode + encode
+    // S3: frames already in memory, chunk them.
+    // Local: stream from mmap — only one batch of compressed data in memory at a time.
+    match source {
+        FrameSource::S3(frames) => {
+            for batch in frames.chunks(BATCH_SIZE) {
+                let decoded = decode_frames_parallel(batch)?;
+                for frame in &decoded {
+                    encoder.write_frame(frame)?;
+                    timestamps.push(frame.timestamp);
+                    pb.inc(1);
+                }
+            }
         }
-        // decoded is dropped here — memory freed before next batch
+        FrameSource::Local(reader) => {
+            reader.process_frames_batched(topic, BATCH_SIZE, |batch| {
+                let decoded = decode_frames_parallel(batch)?;
+                for frame in &decoded {
+                    encoder.write_frame(frame)?;
+                    timestamps.push(frame.timestamp);
+                    pb.inc(1);
+                }
+                Ok(())
+            })?;
+        }
     }
 
     pb.finish_with_message("Encoding complete");
     encoder.finish()?;
 
-    // Summary
+    // Phase 4: Summary
     let first_ts = timestamps.first().unwrap_or(&0.0);
     let last_ts = timestamps.last().unwrap_or(&0.0);
     let duration = last_ts - first_ts;
@@ -319,8 +353,10 @@ fn export_video(
     } else {
         let output_path = output_path.unwrap();
 
-        // Embed timestamps into MP4
-        log.log(&format!("Embedding {} timestamps into MP4...", timestamps.len()));
+        log.log(&format!(
+            "Embedding {} timestamps into MP4...",
+            timestamps.len()
+        ));
         embed_timestamps(&output_path, &timestamps)?;
 
         println!("\nExport complete!");

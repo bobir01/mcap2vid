@@ -51,6 +51,13 @@ pub enum FrameData {
     },
 }
 
+/// Frame count and time range from a quick topic scan (no payload parsing)
+pub struct FrameScanInfo {
+    pub count: usize,
+    pub first_log_time_ns: u64,
+    pub last_log_time_ns: u64,
+}
+
 /// Backing storage for MCAP data — either memory-mapped or in-memory
 enum McapData {
     Mmap(Mmap),
@@ -206,6 +213,177 @@ impl McapReader {
         frames.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap());
 
         Ok(frames)
+    }
+
+    /// Quick scan: count matching frames and get time range.
+    /// Does NOT parse CDR payloads — only checks topic and records log_time.
+    pub fn scan_topic(&self, topic: &str) -> Result<FrameScanInfo> {
+        let mut count = 0usize;
+        let mut first_ts = u64::MAX;
+        let mut last_ts = 0u64;
+
+        for record in mcap::MessageStream::new(self.data.as_ref())? {
+            if let Ok(msg) = record {
+                if msg.channel.topic != topic {
+                    continue;
+                }
+                count += 1;
+                let t = msg.log_time;
+                if t < first_ts {
+                    first_ts = t;
+                }
+                if t > last_ts {
+                    last_ts = t;
+                }
+            }
+        }
+
+        if count == 0 {
+            return Err(anyhow!("No frames found for topic '{}'", topic));
+        }
+
+        Ok(FrameScanInfo {
+            count,
+            first_log_time_ns: first_ts,
+            last_log_time_ns: last_ts,
+        })
+    }
+
+    /// Extract only the first frame from a topic (for getting dimensions)
+    pub fn extract_first_frame(&self, topic: &str) -> Result<VideoFrame> {
+        for record in mcap::MessageStream::new(self.data.as_ref())? {
+            if let Ok(msg) = record {
+                if msg.channel.topic != topic {
+                    continue;
+                }
+
+                let schema_name = msg
+                    .channel
+                    .schema
+                    .as_ref()
+                    .map(|s| s.name.as_str())
+                    .unwrap_or("");
+                let msg_type = ImageMessageType::from_schema_name(schema_name)
+                    .ok_or_else(|| anyhow!("Topic '{}' is not an image topic", topic))?;
+
+                return Ok(match msg_type {
+                    ImageMessageType::Image => {
+                        let img = parse_image(&msg.data)?;
+                        VideoFrame {
+                            timestamp: img.header.stamp.to_unix_timestamp(),
+                            sequence: 0,
+                            data: FrameData::Raw {
+                                width: img.width,
+                                height: img.height,
+                                encoding: img.encoding,
+                                step: img.step,
+                                data: img.data,
+                            },
+                        }
+                    }
+                    ImageMessageType::CompressedImage => {
+                        let img = parse_compressed_image(&msg.data)?;
+                        VideoFrame {
+                            timestamp: img.header.stamp.to_unix_timestamp(),
+                            sequence: 0,
+                            data: FrameData::Compressed {
+                                format: img.format,
+                                data: img.data,
+                            },
+                        }
+                    }
+                });
+            }
+        }
+        Err(anyhow!("No frames found for topic '{}'", topic))
+    }
+
+    /// Stream frames in batches — only one batch of compressed data in memory at a time.
+    /// Calls `on_batch` with each batch of up to `batch_size` frames.
+    pub fn process_frames_batched<F>(
+        &self,
+        topic: &str,
+        batch_size: usize,
+        mut on_batch: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[VideoFrame]) -> Result<()>,
+    {
+        let mut batch = Vec::with_capacity(batch_size);
+        let mut message_type: Option<ImageMessageType> = None;
+        let mut sequence = 0u64;
+
+        for record in mcap::MessageStream::new(self.data.as_ref())? {
+            match record {
+                Ok(msg) => {
+                    if msg.channel.topic != topic {
+                        continue;
+                    }
+
+                    if message_type.is_none() {
+                        let schema_name = msg
+                            .channel
+                            .schema
+                            .as_ref()
+                            .map(|s| s.name.as_str())
+                            .unwrap_or("");
+                        message_type = ImageMessageType::from_schema_name(schema_name);
+                        if message_type.is_none() {
+                            return Err(anyhow!(
+                                "Topic '{}' does not contain image messages (schema: {})",
+                                topic,
+                                schema_name
+                            ));
+                        }
+                    }
+
+                    let frame = match message_type.unwrap() {
+                        ImageMessageType::Image => {
+                            let img = parse_image(&msg.data)?;
+                            VideoFrame {
+                                timestamp: img.header.stamp.to_unix_timestamp(),
+                                sequence,
+                                data: FrameData::Raw {
+                                    width: img.width,
+                                    height: img.height,
+                                    encoding: img.encoding,
+                                    step: img.step,
+                                    data: img.data,
+                                },
+                            }
+                        }
+                        ImageMessageType::CompressedImage => {
+                            let img = parse_compressed_image(&msg.data)?;
+                            VideoFrame {
+                                timestamp: img.header.stamp.to_unix_timestamp(),
+                                sequence,
+                                data: FrameData::Compressed {
+                                    format: img.format,
+                                    data: img.data,
+                                },
+                            }
+                        }
+                    };
+
+                    batch.push(frame);
+                    sequence += 1;
+
+                    if batch.len() >= batch_size {
+                        on_batch(&batch)?;
+                        batch.clear();
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Warning: Error reading message: {}", e);
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            on_batch(&batch)?;
+        }
+
+        Ok(())
     }
 
     /// List all topics that contain metadata (CameraInfo, TF)
