@@ -126,6 +126,53 @@ impl FfmpegEncoder {
         }
     }
 
+    /// Start FFmpeg encoder that outputs to stdout as fragmented MP4 (for streaming)
+    pub fn new_stdout(config: EncoderConfig) -> Result<Self> {
+        let threads_arg = if config.threads == 0 {
+            "0".to_string()
+        } else {
+            config.threads.to_string()
+        };
+
+        let expected_frame_size = (config.width as usize) * (config.height as usize) * 3;
+
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-y",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-s", &format!("{}x{}", config.width, config.height),
+            "-r", &format!("{}", config.fps),
+            "-i", "-",
+            "-c:v", "libx264",
+            "-preset", &config.preset,
+            "-crf", &config.crf.to_string(),
+            "-pix_fmt", "yuv420p",
+            "-threads", &threads_arg,
+            "-f", "mp4",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "pipe:1",
+        ]);
+
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::inherit()); // FFmpeg stdout → process stdout (the video stream)
+        cmd.stderr(Stdio::piped());
+
+        let child = cmd.spawn().map_err(|e| {
+            anyhow!(
+                "Failed to start FFmpeg. Is it installed? Error: {}",
+                e
+            )
+        })?;
+
+        Ok(Self {
+            child,
+            config,
+            expected_frame_size,
+            frames_written: 0,
+        })
+    }
+
     /// Finish encoding and wait for FFmpeg to complete
     pub fn finish(mut self) -> Result<()> {
         // Close stdin to signal end of input

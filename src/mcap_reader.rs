@@ -51,9 +51,24 @@ pub enum FrameData {
     },
 }
 
-/// MCAP file reader with memory-mapped access
+/// Backing storage for MCAP data — either memory-mapped or in-memory
+enum McapData {
+    Mmap(Mmap),
+    InMemory(Vec<u8>),
+}
+
+impl AsRef<[u8]> for McapData {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            McapData::Mmap(m) => m.as_ref(),
+            McapData::InMemory(v) => v.as_ref(),
+        }
+    }
+}
+
+/// MCAP file reader supporting both memory-mapped files and in-memory data
 pub struct McapReader {
-    mmap: Mmap,
+    data: McapData,
 }
 
 impl McapReader {
@@ -61,7 +76,12 @@ impl McapReader {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path.as_ref())?;
         let mmap = unsafe { Mmap::map(&file)? };
-        Ok(Self { mmap })
+        Ok(Self { data: McapData::Mmap(mmap) })
+    }
+
+    /// Create a reader from in-memory data (e.g., downloaded from S3)
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { data: McapData::InMemory(bytes) }
     }
 
     /// List all topics that contain image data
@@ -71,7 +91,7 @@ impl McapReader {
         let mut topic_message_counts: HashMap<String, usize> = HashMap::new();
         let mut topic_schema: HashMap<String, String> = HashMap::new();
 
-        for record in mcap::MessageStream::new(&self.mmap)? {
+        for record in mcap::MessageStream::new(self.data.as_ref())? {
             match record {
                 Ok(msg) => {
                     let topic_name = msg.channel.topic.clone();
@@ -116,7 +136,7 @@ impl McapReader {
         let mut message_type: Option<ImageMessageType> = None;
         let mut sequence = 0u64;
 
-        for record in mcap::MessageStream::new(&self.mmap)? {
+        for record in mcap::MessageStream::new(self.data.as_ref())? {
             match record {
                 Ok(msg) => {
                     if msg.channel.topic != topic {
@@ -194,7 +214,7 @@ impl McapReader {
         let mut topic_message_counts: HashMap<String, usize> = HashMap::new();
         let mut topic_schema: HashMap<String, String> = HashMap::new();
 
-        for record in mcap::MessageStream::new(&self.mmap)? {
+        for record in mcap::MessageStream::new(self.data.as_ref())? {
             match record {
                 Ok(msg) => {
                     let topic_name = msg.channel.topic.clone();
@@ -236,7 +256,7 @@ impl McapReader {
     pub fn extract_camera_info(&self, topic: &str, only_first: bool) -> Result<Vec<CameraInfo>> {
         let mut messages = Vec::new();
 
-        for record in mcap::MessageStream::new(&self.mmap)? {
+        for record in mcap::MessageStream::new(self.data.as_ref())? {
             match record {
                 Ok(msg) => {
                     if msg.channel.topic != topic {
@@ -267,7 +287,7 @@ impl McapReader {
     pub fn extract_tf_messages(&self, topic: &str) -> Result<Vec<TFMessage>> {
         let mut messages = Vec::new();
 
-        for record in mcap::MessageStream::new(&self.mmap)? {
+        for record in mcap::MessageStream::new(self.data.as_ref())? {
             match record {
                 Ok(msg) => {
                     if msg.channel.topic != topic {

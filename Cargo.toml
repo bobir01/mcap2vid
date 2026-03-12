@@ -21,6 +21,14 @@ anyhow = "1"
 indicatif = "0.17"
 byteorder = "1"
 
+# S3-compatible remote reading
+ureq = "2"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+lz4_flex = "0.11"
+zstd = "0.11"
+
 [profile.release]
 lto = true
 codegen-units = 1

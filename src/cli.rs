@@ -14,23 +14,23 @@ pub struct Cli {
 pub enum Commands {
     /// List available video topics in an MCAP file
     List {
-        /// Input MCAP file path
+        /// Input MCAP file path or s3c:// URL
         #[arg(short, long)]
-        input: PathBuf,
+        input: String,
     },
     /// Export video from MCAP to MP4
     Export {
-        /// Input MCAP file path
+        /// Input MCAP file path or s3c:// URL
         #[arg(short, long)]
-        input: PathBuf,
+        input: String,
 
         /// Video topic to extract (e.g., /camera/image_raw)
         #[arg(short, long)]
         topic: String,
 
-        /// Output MP4 file path
+        /// Output MP4 file path, or "-" for stdout (zero disk writes)
         #[arg(short, long)]
-        output: PathBuf,
+        output: String,
 
         /// Suffix appended to the output filename (e.g., "ego" produces name_ego.mp4)
         #[arg(short, long)]
@@ -69,15 +69,15 @@ pub enum Commands {
 pub enum MetadataAction {
     /// List available metadata topics (CameraInfo, TF)
     List {
-        /// Input MCAP file path
+        /// Input MCAP file path or s3c:// URL
         #[arg(short, long)]
-        input: PathBuf,
+        input: String,
     },
     /// Export CameraInfo to JSON
     CameraInfo {
-        /// Input MCAP file path
+        /// Input MCAP file path or s3c:// URL
         #[arg(short, long)]
-        input: PathBuf,
+        input: String,
 
         /// CameraInfo topic to extract
         #[arg(short, long)]
@@ -97,9 +97,9 @@ pub enum MetadataAction {
     },
     /// Export TF transforms to JSON
     Tf {
-        /// Input MCAP file path
+        /// Input MCAP file path or s3c:// URL
         #[arg(short, long)]
-        input: PathBuf,
+        input: String,
 
         /// TF topic to extract (default: /tf)
         #[arg(short, long, default_value = "/tf")]
