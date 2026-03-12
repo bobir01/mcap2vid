@@ -14,13 +14,14 @@ use rayon::ThreadPoolBuilder;
 use std::path::{Path, PathBuf};
 
 use cli::{Cli, Commands, MetadataAction};
-use decoder::decode_frames_parallel;
-use encoder::{
-    calculate_fps, get_frame_dimensions, validate_frame_dimensions, EncoderConfig, FfmpegEncoder,
-};
+use decoder::{decode_frame, decode_frames_parallel};
+use encoder::{EncoderConfig, FfmpegEncoder};
 use mcap_reader::{McapReader, VideoFrame};
 use s3_reader::{is_s3_url, S3Client, S3Url};
 use timestamp::{embed_timestamps, read_timestamps};
+
+/// Max frames decoded in memory at once. At 1080p (~6 MB/frame) this is ~3 GB peak.
+const BATCH_SIZE: usize = 500;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -177,7 +178,7 @@ fn export_video(
         num_threads
     ));
 
-    // Extract frames — selective for S3, full scan for local
+    // Extract compressed frames (small in memory — just JPEG/PNG blobs)
     let frames: Vec<VideoFrame> = if is_s3_url(input) {
         log.log(&format!("Reading from S3: {}", input));
         let s3_url = S3Url::parse(input)?;
@@ -205,40 +206,30 @@ fn export_video(
         anyhow::bail!("No frames found for topic '{}'", topic);
     }
 
-    // Decode frames in parallel
-    log.log(&format!("Decoding {} frames in parallel...", frames.len()));
-    let pb = log.progress_bar(frames.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
-            )
-            .unwrap()
-            .progress_chars("#>-"),
-    );
+    // Decode first frame to get dimensions
+    let first_decoded = decode_frame(&frames[0])?;
+    let (width, height) = (first_decoded.width, first_decoded.height);
+    drop(first_decoded);
 
-    let decoded_frames = decode_frames_parallel(&frames)?;
-    pb.finish_with_message("Decoding complete");
+    // Calculate FPS from compressed frame timestamps (no full decode needed)
+    let fps = if frames.len() >= 2 {
+        let duration = frames.last().unwrap().timestamp - frames[0].timestamp;
+        if duration > 0.0 {
+            ((frames.len() - 1) as f64 / duration).clamp(1.0, 120.0)
+        } else {
+            30.0
+        }
+    } else {
+        30.0
+    };
 
-    // Validate dimensions
-    log.log("Validating frame dimensions...");
-    validate_frame_dimensions(&decoded_frames)?;
-
-    let (width, height) = get_frame_dimensions(&decoded_frames)
-        .ok_or_else(|| anyhow::anyhow!("No frames to encode"))?;
-    let fps = calculate_fps(&decoded_frames);
-
-    let expected_size = (width as usize) * (height as usize) * 3;
     log.log(&format!(
-        "Video: {}x{} @ {:.2} FPS, {} frames (frame size: {} bytes)",
+        "Video: {}x{} @ {:.2} FPS, {} frames",
         width,
         height,
         fps,
-        decoded_frames.len(),
-        expected_size
+        frames.len()
     ));
-
-    let timestamps: Vec<f64> = decoded_frames.iter().map(|f| f.timestamp).collect();
 
     let config = EncoderConfig {
         width,
@@ -249,41 +240,9 @@ fn export_video(
         threads,
     };
 
-    if to_stdout {
-        // Stream to stdout — fragmented MP4, no FTSS, all logging to stderr
-        log.log(&format!(
-            "Encoding to H.264 (preset: {}, CRF: {}) -> stdout",
-            preset, crf
-        ));
-
-        let mut encoder = FfmpegEncoder::new_stdout(config)?;
-
-        let pb = log.progress_bar(decoded_frames.len() as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
-                )
-                .unwrap()
-                .progress_chars("#>-"),
-        );
-
-        for frame in &decoded_frames {
-            encoder.write_frame(frame)?;
-            pb.inc(1);
-        }
-        pb.finish_with_message("Encoding complete");
-        encoder.finish()?;
-
-        let first_ts = timestamps.first().unwrap_or(&0.0);
-        let last_ts = timestamps.last().unwrap_or(&0.0);
-        eprintln!("\nExport complete!");
-        eprintln!("  Duration: {:.2}s", last_ts - first_ts);
-        eprintln!("  Frames: {}", decoded_frames.len());
-        eprintln!("  Time range: {:.6} - {:.6}", first_ts, last_ts);
-    } else {
-        // Write to file — standard MP4 with FTSS timestamps
-        let output_path = if let Some(sfx) = suffix {
+    // Resolve output path (for file output)
+    let output_path = if !to_stdout {
+        Some(if let Some(sfx) = suffix {
             let p = PathBuf::from(output);
             let stem = p.file_stem().unwrap_or_default().to_string_lossy();
             let ext = p
@@ -293,44 +252,81 @@ fn export_video(
             p.with_file_name(format!("{}_{}.{}", stem, sfx, ext))
         } else {
             PathBuf::from(output)
-        };
+        })
+    } else {
+        None
+    };
 
+    // Start encoder
+    let mut encoder = if to_stdout {
+        log.log(&format!(
+            "Encoding to H.264 (preset: {}, CRF: {}) -> stdout",
+            preset, crf
+        ));
+        FfmpegEncoder::new_stdout(config)?
+    } else {
         log.log(&format!(
             "Encoding to H.264 (preset: {}, CRF: {})...",
             preset, crf
         ));
+        FfmpegEncoder::new(output_path.as_ref().unwrap(), config)?
+    };
 
-        let mut encoder = FfmpegEncoder::new(&output_path, config)?;
+    // Batched decode + encode: decode BATCH_SIZE frames at a time, write to FFmpeg, free memory.
+    // At 1080p (~6 MB/frame), 500 frames ≈ 3 GB peak decoded memory.
+    let total = frames.len();
+    let num_batches = (total + BATCH_SIZE - 1) / BATCH_SIZE;
+    log.log(&format!(
+        "Processing {} frames in {} batches of {}...",
+        total, num_batches, BATCH_SIZE
+    ));
 
-        let pb = log.progress_bar(decoded_frames.len() as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
-                )
-                .unwrap()
-                .progress_chars("#>-"),
-        );
+    let pb = log.progress_bar(total as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
 
-        for frame in &decoded_frames {
+    let mut timestamps = Vec::with_capacity(total);
+
+    for batch in frames.chunks(BATCH_SIZE) {
+        let decoded = decode_frames_parallel(batch)?;
+        for frame in &decoded {
             encoder.write_frame(frame)?;
+            timestamps.push(frame.timestamp);
             pb.inc(1);
         }
-        pb.finish_with_message("Encoding complete");
+        // decoded is dropped here — memory freed before next batch
+    }
 
-        encoder.finish()?;
-        println!("FFmpeg encoding finished");
+    pb.finish_with_message("Encoding complete");
+    encoder.finish()?;
 
-        println!("Embedding {} timestamps into MP4...", timestamps.len());
+    // Summary
+    let first_ts = timestamps.first().unwrap_or(&0.0);
+    let last_ts = timestamps.last().unwrap_or(&0.0);
+    let duration = last_ts - first_ts;
+
+    if to_stdout {
+        eprintln!("\nExport complete!");
+        eprintln!("  Duration: {:.2}s", duration);
+        eprintln!("  Frames: {}", total);
+        eprintln!("  Time range: {:.6} - {:.6}", first_ts, last_ts);
+    } else {
+        let output_path = output_path.unwrap();
+
+        // Embed timestamps into MP4
+        log.log(&format!("Embedding {} timestamps into MP4...", timestamps.len()));
         embed_timestamps(&output_path, &timestamps)?;
-        println!("Timestamps embedded successfully");
 
-        let first_ts = timestamps.first().unwrap_or(&0.0);
-        let last_ts = timestamps.last().unwrap_or(&0.0);
         println!("\nExport complete!");
         println!("  Output: {}", output_path.display());
-        println!("  Duration: {:.2}s", last_ts - first_ts);
-        println!("  Frames: {}", decoded_frames.len());
+        println!("  Duration: {:.2}s", duration);
+        println!("  Frames: {}", total);
         println!("  Time range: {:.6} - {:.6}", first_ts, last_ts);
         println!("\nTimestamps stored in FTSS atom. Use 'verify' command to extract them.");
     }
