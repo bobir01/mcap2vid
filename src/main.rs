@@ -20,8 +20,8 @@ use mcap_reader::{McapReader, VideoFrame};
 use s3_reader::{is_s3_url, S3Client, S3Url};
 use timestamp::{embed_timestamps, read_timestamps};
 
-/// Max frames decoded in memory at once. At 1080p (~6 MB/frame) this is ~3 GB peak.
-const BATCH_SIZE: usize = 500;
+/// Max frames decoded in memory at once. At 1080p (~6 MB/frame) this is ~620 MB peak.
+const BATCH_SIZE: usize = 100;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
