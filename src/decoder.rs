@@ -38,12 +38,10 @@ impl BadFrame {
     /// Truncate a decoder error message to a single ≤120-char line suitable for logging.
     fn sanitize_reason(raw: &str) -> String {
         let one_line = raw.replace(['\n', '\r'], " ");
-        if one_line.len() <= 120 {
+        if one_line.chars().count() <= 120 {
             one_line
         } else {
-            let mut s = one_line;
-            s.truncate(120);
-            s
+            one_line.chars().take(120).collect()
         }
     }
 }
@@ -241,4 +239,35 @@ pub fn decode_frames_parallel(frames: &[VideoFrame]) -> Result<Vec<DecodedFrame>
     decoded.sort_by_key(|f| f.sequence);
 
     Ok(decoded)
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::BadFrame;
+
+    #[test]
+    fn sanitize_reason_is_utf8_safe_on_multibyte_boundary() {
+        // Construct a 200-char string of 2-byte chars so byte 120 falls mid-char.
+        let input: String = std::iter::repeat('ß').take(200).collect();
+        let out = BadFrame::sanitize_reason(&input);
+        // Must not panic. Must be valid UTF-8 (guaranteed by String type).
+        assert!(out.chars().count() <= 120);
+        assert!(out.chars().all(|c| c == 'ß'));
+    }
+
+    #[test]
+    fn sanitize_reason_replaces_newlines() {
+        let input = "line1\nline2\rline3";
+        let out = BadFrame::sanitize_reason(input);
+        assert!(!out.contains('\n'));
+        assert!(!out.contains('\r'));
+        assert!(out.contains("line1 line2 line3"));
+    }
+
+    #[test]
+    fn sanitize_reason_short_input_is_unchanged() {
+        let input = "short error";
+        let out = BadFrame::sanitize_reason(input);
+        assert_eq!(out, "short error");
+    }
 }
