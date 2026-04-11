@@ -14,7 +14,7 @@ use rayon::ThreadPoolBuilder;
 use std::path::{Path, PathBuf};
 
 use cli::{Cli, Commands, MetadataAction};
-use decoder::{decode_frame, decode_frames_parallel};
+use decoder::{decode_frame, decode_frames_parallel, BadFrame, DecodeOutcome, DecodedFrame};
 use encoder::{EncoderConfig, FfmpegEncoder};
 use mcap_reader::{McapReader, VideoFrame};
 use s3_reader::{is_s3_url, S3Client, S3Url};
@@ -36,6 +36,8 @@ fn main() -> Result<()> {
             threads,
             preset,
             crf,
+            max_bad_frames,
+            max_bad_frames_pct,
         } => export_video(
             &input,
             &topic,
@@ -44,6 +46,8 @@ fn main() -> Result<()> {
             threads,
             &preset,
             crf,
+            max_bad_frames,
+            max_bad_frames_pct,
         ),
         Commands::Verify { input, all } => verify_timestamps(&input, all),
         Commands::Metadata { action } => handle_metadata(action),
@@ -151,6 +155,98 @@ fn list_topics(input: &str) -> Result<()> {
     Ok(())
 }
 
+/// Tracks bad-frame accounting for a single export run and enforces the
+/// threshold configured by `--max-bad-frames` / `--max-bad-frames-pct`.
+struct BadFrameState {
+    last_good: Option<DecodedFrame>,
+    bad_count: usize,
+    total_expected: usize,
+    max_abs: usize,
+    max_pct: f64,
+}
+
+impl BadFrameState {
+    fn new(total_expected: usize, max_abs: usize, max_pct: f64) -> Self {
+        Self {
+            last_good: None,
+            bad_count: 0,
+            total_expected,
+            max_abs,
+            max_pct,
+        }
+    }
+
+    fn record_good(&mut self, frame: &DecodedFrame) {
+        self.last_good = Some(frame.clone());
+    }
+
+    /// Produce a repeat frame (clone of `last_good` with the bad frame's
+    /// timestamp and sequence), or `None` if no good frame has been seen yet.
+    fn repeat_for(&self, bad: &BadFrame) -> Option<DecodedFrame> {
+        self.last_good.as_ref().map(|prev| {
+            let mut repeat = prev.clone();
+            repeat.timestamp = bad.timestamp;
+            repeat.sequence = bad.sequence;
+            repeat
+        })
+    }
+
+    fn note_bad(&mut self) {
+        self.bad_count += 1;
+    }
+
+    /// Returns `true` if the threshold is exceeded. First `max_abs` bad frames
+    /// are always tolerated; beyond that, the percentage gate applies.
+    fn threshold_exceeded(&self) -> bool {
+        if self.bad_count <= self.max_abs {
+            return false;
+        }
+        if self.total_expected == 0 {
+            return true;
+        }
+        let ratio = (self.bad_count as f64) / (self.total_expected as f64);
+        ratio > (self.max_pct / 100.0)
+    }
+
+    fn ratio_pct(&self) -> f64 {
+        if self.total_expected == 0 {
+            0.0
+        } else {
+            (self.bad_count as f64) * 100.0 / (self.total_expected as f64)
+        }
+    }
+
+    fn summary_line(&self) -> String {
+        format!(
+            "[bad-frame] summary: {} bad / {} total ({:.3}%), threshold={} abs / {:.2}%",
+            self.bad_count,
+            self.total_expected,
+            self.ratio_pct(),
+            self.max_abs,
+            self.max_pct
+        )
+    }
+
+    fn threshold_error(&self) -> anyhow::Error {
+        anyhow::anyhow!(
+            "aborting: bad-frame threshold exceeded — {} bad / {} scanned ({:.2}%) > {:.2}% after {} free",
+            self.bad_count,
+            self.total_expected,
+            self.ratio_pct(),
+            self.max_pct,
+            self.max_abs
+        )
+    }
+}
+
+/// Format and write a per-frame bad-frame log line to stderr.
+fn log_bad_frame(bad: &BadFrame, action: &str) {
+    eprintln!(
+        "[bad-frame] seq={} ts={:.6} size={} reason=\"{}\" action={}",
+        bad.sequence, bad.timestamp, bad.size_bytes, bad.reason, action
+    );
+}
+
 fn export_video(
     input: &str,
     topic: &str,
@@ -159,7 +255,15 @@ fn export_video(
     threads: usize,
     preset: &str,
     crf: u8,
+    max_bad_frames: usize,
+    max_bad_frames_pct: f64,
 ) -> Result<()> {
+    if !max_bad_frames_pct.is_finite() || max_bad_frames_pct < 0.0 || max_bad_frames_pct > 100.0 {
+        anyhow::bail!(
+            "--max-bad-frames-pct must be a finite number in [0.0, 100.0], got {}",
+            max_bad_frames_pct
+        );
+    }
     let to_stdout = output == "-";
     let log = Logger {
         to_stderr: to_stdout,
@@ -308,28 +412,72 @@ fn export_video(
     );
 
     let mut timestamps = Vec::with_capacity(total);
+    let mut bad_state = BadFrameState::new(total, max_bad_frames, max_bad_frames_pct);
 
-    // Phase 3: Batched decode + encode
+    // Phase 3: Batched decode + encode.
+    //
+    // Each decoded outcome is handled individually:
+    //   Ok   → write, push timestamp, cache as last_good
+    //   Bad  → log, repeat last_good (or drop if no good frame yet), check threshold
+    //
     // S3: frames already in memory, chunk them.
     // Local: stream from mmap — only one batch of compressed data in memory at a time.
     match source {
         FrameSource::S3(frames) => {
             for batch in frames.chunks(BATCH_SIZE) {
-                let decoded = decode_frames_parallel(batch)?;
-                for frame in &decoded {
-                    encoder.write_frame(frame)?;
-                    timestamps.push(frame.timestamp);
-                    pb.inc(1);
+                let outcomes = decode_frames_parallel(batch);
+                for outcome in outcomes {
+                    match outcome {
+                        DecodeOutcome::Ok(frame) => {
+                            encoder.write_frame(&frame)?;
+                            timestamps.push(frame.timestamp);
+                            bad_state.record_good(&frame);
+                            pb.inc(1);
+                        }
+                        DecodeOutcome::Bad(bad) => {
+                            if let Some(repeat) = bad_state.repeat_for(&bad) {
+                                log_bad_frame(&bad, "repeat-previous");
+                                encoder.write_frame(&repeat)?;
+                                timestamps.push(bad.timestamp);
+                            } else {
+                                log_bad_frame(&bad, "drop");
+                            }
+                            bad_state.note_bad();
+                            pb.inc(1);
+                            if bad_state.threshold_exceeded() {
+                                return Err(bad_state.threshold_error());
+                            }
+                        }
+                    }
                 }
             }
         }
         FrameSource::Local(reader) => {
             reader.process_frames_batched(topic, BATCH_SIZE, |batch| {
-                let decoded = decode_frames_parallel(batch)?;
-                for frame in &decoded {
-                    encoder.write_frame(frame)?;
-                    timestamps.push(frame.timestamp);
-                    pb.inc(1);
+                let outcomes = decode_frames_parallel(batch);
+                for outcome in outcomes {
+                    match outcome {
+                        DecodeOutcome::Ok(frame) => {
+                            encoder.write_frame(&frame)?;
+                            timestamps.push(frame.timestamp);
+                            bad_state.record_good(&frame);
+                            pb.inc(1);
+                        }
+                        DecodeOutcome::Bad(bad) => {
+                            if let Some(repeat) = bad_state.repeat_for(&bad) {
+                                log_bad_frame(&bad, "repeat-previous");
+                                encoder.write_frame(&repeat)?;
+                                timestamps.push(bad.timestamp);
+                            } else {
+                                log_bad_frame(&bad, "drop");
+                            }
+                            bad_state.note_bad();
+                            pb.inc(1);
+                            if bad_state.threshold_exceeded() {
+                                return Err(bad_state.threshold_error());
+                            }
+                        }
+                    }
                 }
                 Ok(())
             })?;
@@ -338,6 +486,8 @@ fn export_video(
 
     pb.finish_with_message("Encoding complete");
     encoder.finish()?;
+
+    eprintln!("{}", bad_state.summary_line());
 
     // Phase 4: Summary
     let first_ts = timestamps.first().unwrap_or(&0.0);
