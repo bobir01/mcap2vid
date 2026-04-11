@@ -276,22 +276,6 @@ pub fn decode_frames_parallel(frames: &[VideoFrame]) -> Vec<DecodeOutcome> {
     outcomes
 }
 
-/// TEMPORARY Task 2 → Task 4 bridge. Will be removed when main.rs is rewired.
-#[doc(hidden)]
-pub fn decode_frames_parallel_legacy(frames: &[VideoFrame]) -> Result<Vec<DecodedFrame>> {
-    let outcomes = decode_frames_parallel(frames);
-    let mut decoded = Vec::with_capacity(outcomes.len());
-    for o in outcomes {
-        match o {
-            DecodeOutcome::Ok(f) => decoded.push(f),
-            DecodeOutcome::Bad(b) => {
-                return Err(anyhow!("decode failed at seq={}: {}", b.sequence, b.reason))
-            }
-        }
-    }
-    Ok(decoded)
-}
-
 #[cfg(test)]
 mod sanitize_tests {
     use super::BadFrame;
