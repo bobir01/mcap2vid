@@ -14,7 +14,7 @@ use rayon::ThreadPoolBuilder;
 use std::path::{Path, PathBuf};
 
 use cli::{Cli, Commands, MetadataAction};
-use decoder::{decode_frame, decode_frames_parallel};
+use decoder::{decode_frame, decode_frames_parallel_legacy};
 use encoder::{EncoderConfig, FfmpegEncoder};
 use mcap_reader::{McapReader, VideoFrame};
 use s3_reader::{is_s3_url, S3Client, S3Url};
@@ -315,7 +315,7 @@ fn export_video(
     match source {
         FrameSource::S3(frames) => {
             for batch in frames.chunks(BATCH_SIZE) {
-                let decoded = decode_frames_parallel(batch)?;
+                let decoded = decode_frames_parallel_legacy(batch)?;
                 for frame in &decoded {
                     encoder.write_frame(frame)?;
                     timestamps.push(frame.timestamp);
@@ -325,7 +325,7 @@ fn export_video(
         }
         FrameSource::Local(reader) => {
             reader.process_frames_batched(topic, BATCH_SIZE, |batch| {
-                let decoded = decode_frames_parallel(batch)?;
+                let decoded = decode_frames_parallel_legacy(batch)?;
                 for frame in &decoded {
                     encoder.write_frame(frame)?;
                     timestamps.push(frame.timestamp);

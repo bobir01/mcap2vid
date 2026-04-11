@@ -225,19 +225,70 @@ fn decode_raw(
     })
 }
 
-/// Decode multiple frames in parallel using rayon
-pub fn decode_frames_parallel(frames: &[VideoFrame]) -> Result<Vec<DecodedFrame>> {
-    let results: Vec<Result<DecodedFrame>> = frames.par_iter().map(|f| decode_frame(f)).collect();
+/// Decode multiple frames in parallel using rayon.
+///
+/// Returns one `DecodeOutcome` per input frame, preserving sequence order.
+/// Decode errors and panics inside the `image` crate are captured as
+/// `DecodeOutcome::Bad` so a single corrupt frame cannot abort the whole export.
+pub fn decode_frames_parallel(frames: &[VideoFrame]) -> Vec<DecodeOutcome> {
+    let mut outcomes: Vec<DecodeOutcome> = frames
+        .par_iter()
+        .map(|f| {
+            let seq = f.sequence;
+            let ts = f.timestamp;
+            let size = payload_size(f);
 
-    // Collect results, propagating first error
-    let mut decoded: Vec<DecodedFrame> = Vec::with_capacity(results.len());
-    for result in results {
-        decoded.push(result?);
+            let caught =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_frame(f)));
+
+            match caught {
+                Ok(Ok(decoded)) => DecodeOutcome::Ok(decoded),
+                Ok(Err(err)) => DecodeOutcome::Bad(BadFrame {
+                    sequence: seq,
+                    timestamp: ts,
+                    size_bytes: size,
+                    reason: BadFrame::sanitize_reason(&err.to_string()),
+                }),
+                Err(panic) => {
+                    let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                        format!("panic: {}", s)
+                    } else if let Some(s) = panic.downcast_ref::<String>() {
+                        format!("panic: {}", s)
+                    } else {
+                        "panic: (non-string payload)".to_string()
+                    };
+                    DecodeOutcome::Bad(BadFrame {
+                        sequence: seq,
+                        timestamp: ts,
+                        size_bytes: size,
+                        reason: BadFrame::sanitize_reason(&msg),
+                    })
+                }
+            }
+        })
+        .collect();
+
+    outcomes.sort_by_key(|o| match o {
+        DecodeOutcome::Ok(f) => f.sequence,
+        DecodeOutcome::Bad(b) => b.sequence,
+    });
+
+    outcomes
+}
+
+/// TEMPORARY Task 2 → Task 4 bridge. Will be removed when main.rs is rewired.
+#[doc(hidden)]
+pub fn decode_frames_parallel_legacy(frames: &[VideoFrame]) -> Result<Vec<DecodedFrame>> {
+    let outcomes = decode_frames_parallel(frames);
+    let mut decoded = Vec::with_capacity(outcomes.len());
+    for o in outcomes {
+        match o {
+            DecodeOutcome::Ok(f) => decoded.push(f),
+            DecodeOutcome::Bad(b) => {
+                return Err(anyhow!("decode failed at seq={}: {}", b.sequence, b.reason))
+            }
+        }
     }
-
-    // Sort by sequence to maintain order
-    decoded.sort_by_key(|f| f.sequence);
-
     Ok(decoded)
 }
 
@@ -269,5 +320,98 @@ mod sanitize_tests {
         let input = "short error";
         let out = BadFrame::sanitize_reason(input);
         assert_eq!(out, "short error");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcap_reader::{FrameData, VideoFrame};
+
+    fn raw_frame(seq: u64, width: u32, height: u32, data: Vec<u8>) -> VideoFrame {
+        VideoFrame {
+            timestamp: seq as f64,
+            sequence: seq,
+            data: FrameData::Raw {
+                width,
+                height,
+                encoding: "rgb8".to_string(),
+                step: width * 3,
+                data,
+            },
+        }
+    }
+
+    fn compressed_frame(seq: u64, data: Vec<u8>) -> VideoFrame {
+        VideoFrame {
+            timestamp: seq as f64,
+            sequence: seq,
+            data: FrameData::Compressed {
+                format: "jpeg".to_string(),
+                data,
+            },
+        }
+    }
+
+    #[test]
+    fn decode_frames_parallel_returns_outcomes_for_mixed_input() {
+        // Good: 2x2 rgb8 = 12 bytes
+        let good = raw_frame(0, 2, 2, vec![0u8; 12]);
+        // Bad: truncated rgb8 (need 12, got 3)
+        let truncated = raw_frame(1, 2, 2, vec![0u8; 3]);
+        // Bad: garbage JPEG
+        let garbage = compressed_frame(2, vec![0xFF, 0xD8, 0xFF, 0xE0, 0xDE, 0xAD]);
+
+        let outcomes = decode_frames_parallel(&[good, truncated, garbage]);
+
+        assert_eq!(outcomes.len(), 3);
+        match &outcomes[0] {
+            DecodeOutcome::Ok(f) => {
+                assert_eq!(f.sequence, 0);
+                assert_eq!(f.width, 2);
+                assert_eq!(f.height, 2);
+            }
+            DecodeOutcome::Bad(b) => panic!("expected Ok, got Bad: {}", b.reason),
+        }
+        match &outcomes[1] {
+            DecodeOutcome::Bad(b) => {
+                assert_eq!(b.sequence, 1);
+                assert_eq!(b.size_bytes, 3);
+                assert!(
+                    b.reason.to_lowercase().contains("insufficient")
+                        || b.reason.to_lowercase().contains("image data"),
+                    "unexpected reason: {}",
+                    b.reason
+                );
+            }
+            DecodeOutcome::Ok(_) => panic!("expected Bad for truncated raw frame"),
+        }
+        match &outcomes[2] {
+            DecodeOutcome::Bad(b) => {
+                assert_eq!(b.sequence, 2);
+                assert_eq!(b.size_bytes, 6);
+                assert!(!b.reason.is_empty());
+            }
+            DecodeOutcome::Ok(_) => panic!("expected Bad for garbage JPEG"),
+        }
+    }
+
+    #[test]
+    fn decode_frames_parallel_sorts_outcomes_by_sequence() {
+        let frames = vec![
+            raw_frame(2, 1, 1, vec![0u8; 3]),
+            raw_frame(0, 1, 1, vec![0u8; 3]),
+            raw_frame(1, 1, 1, vec![0u8; 0]), // bad
+        ];
+        let outcomes = decode_frames_parallel(&frames);
+        assert_eq!(outcomes.len(), 3);
+        let seqs: Vec<u64> = outcomes
+            .iter()
+            .map(|o| match o {
+                DecodeOutcome::Ok(f) => f.sequence,
+                DecodeOutcome::Bad(b) => b.sequence,
+            })
+            .collect();
+        assert_eq!(seqs, vec![0, 1, 2]);
     }
 }
