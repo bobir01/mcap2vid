@@ -14,6 +14,49 @@ pub struct DecodedFrame {
     pub rgb_data: Vec<u8>, // RGB24 format
 }
 
+/// Outcome of decoding a single frame.
+///
+/// `Ok` carries a fully decoded frame ready for the encoder.
+/// `Bad` carries enough metadata to log the failure and count it toward the
+/// bad-frame threshold without aborting the export.
+#[derive(Debug)]
+pub enum DecodeOutcome {
+    Ok(DecodedFrame),
+    Bad(BadFrame),
+}
+
+/// Metadata describing a frame that failed to decode.
+#[derive(Debug, Clone)]
+pub struct BadFrame {
+    pub sequence: u64,
+    pub timestamp: f64,
+    pub size_bytes: usize,
+    pub reason: String,
+}
+
+impl BadFrame {
+    /// Truncate a decoder error message to a single ≤120-char line suitable for logging.
+    fn sanitize_reason(raw: &str) -> String {
+        let one_line = raw.replace(['\n', '\r'], " ");
+        if one_line.len() <= 120 {
+            one_line
+        } else {
+            let mut s = one_line;
+            s.truncate(120);
+            s
+        }
+    }
+}
+
+/// Return the size in bytes of the underlying payload for a frame
+/// (compressed bytes for compressed frames, raw row data for raw frames).
+fn payload_size(frame: &VideoFrame) -> usize {
+    match &frame.data {
+        FrameData::Compressed { data, .. } => data.len(),
+        FrameData::Raw { data, .. } => data.len(),
+    }
+}
+
 /// Decode a single frame to RGB24 format
 pub fn decode_frame(frame: &VideoFrame) -> Result<DecodedFrame> {
     match &frame.data {
