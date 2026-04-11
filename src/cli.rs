@@ -47,6 +47,18 @@ pub enum Commands {
         /// Constant Rate Factor for quality (0-51, lower = better quality)
         #[arg(long, default_value = "18")]
         crf: u8,
+
+        /// Maximum bad frames always tolerated regardless of percentage.
+        /// First N decode failures never trip the threshold — set to 0 to
+        /// enforce the percentage immediately.
+        #[arg(long, default_value = "10")]
+        max_bad_frames: usize,
+
+        /// Maximum bad frames as percent of total (beyond --max-bad-frames).
+        /// When `bad_count > --max-bad-frames` and `bad_count / total > P%`,
+        /// the export aborts with a non-zero exit code.
+        #[arg(long, default_value = "1.0")]
+        max_bad_frames_pct: f64,
     },
     /// Verify and read embedded timestamps from an MP4 file
     Verify {

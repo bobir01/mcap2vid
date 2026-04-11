@@ -36,6 +36,8 @@ fn main() -> Result<()> {
             threads,
             preset,
             crf,
+            max_bad_frames: _,
+            max_bad_frames_pct: _,
         } => export_video(
             &input,
             &topic,
