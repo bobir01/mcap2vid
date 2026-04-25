@@ -52,6 +52,7 @@ fn payload_size(frame: &VideoFrame) -> usize {
     match &frame.data {
         FrameData::Compressed { data, .. } => data.len(),
         FrameData::Raw { data, .. } => data.len(),
+        FrameData::CompressedVideoPacket { data, .. } => data.len(),
     }
 }
 
@@ -59,6 +60,9 @@ fn payload_size(frame: &VideoFrame) -> usize {
 pub fn decode_frame(frame: &VideoFrame) -> Result<DecodedFrame> {
     match &frame.data {
         FrameData::Compressed { format, data } => decode_compressed(frame, format, data),
+        FrameData::CompressedVideoPacket { .. } => Err(anyhow!(
+            "CompressedVideo packets cannot be decoded as still images; use the packet export path"
+        )),
         FrameData::Raw {
             width,
             height,
@@ -238,8 +242,7 @@ pub fn decode_frames_parallel(frames: &[VideoFrame]) -> Vec<DecodeOutcome> {
             let ts = f.timestamp;
             let size = payload_size(f);
 
-            let caught =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_frame(f)));
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_frame(f)));
 
             match caught {
                 Ok(Ok(decoded)) => DecodeOutcome::Ok(decoded),

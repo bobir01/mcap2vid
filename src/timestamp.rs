@@ -27,9 +27,7 @@ pub fn embed_timestamps<P: AsRef<Path>>(mp4_path: P, timestamps: &[f64]) -> Resu
     let ftss_data = build_ftss_atom(timestamps)?;
 
     // Append to the end of the file (simplest and safest approach)
-    let mut file = OpenOptions::new()
-        .append(true)
-        .open(mp4_path)?;
+    let mut file = OpenOptions::new().append(true).open(mp4_path)?;
 
     file.write_all(&ftss_data)?;
 
@@ -64,8 +62,9 @@ fn find_atom(data: &[u8], atom_type: &[u8; 4], start: usize) -> Option<(usize, u
     let mut pos = start;
 
     while pos + 8 <= data.len() {
-        let size = u32::from_be_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
-        let atype = &data[pos+4..pos+8];
+        let size =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let atype = &data[pos + 4..pos + 8];
 
         if size == 0 {
             break; // Invalid atom
@@ -92,7 +91,8 @@ pub fn read_timestamps<P: AsRef<Path>>(mp4_path: P) -> Result<Vec<f64>> {
     if let Some((ftss_start, ftss_size)) = find_atom(&data, FTSS_ATOM_TYPE, 0) {
         let content_start = ftss_start + 8; // Skip atom header
 
-        if ftss_size < 13 { // Minimum: header(8) + version(1) + count(4)
+        if ftss_size < 13 {
+            // Minimum: header(8) + version(1) + count(4)
             anyhow::bail!("FTSS atom too small");
         }
 

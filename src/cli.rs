@@ -17,6 +17,10 @@ pub enum Commands {
         /// Input MCAP file path or s3c:// URL
         #[arg(short, long)]
         input: String,
+
+        /// Show exact schema name, schema encoding, and message encoding
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Export video from MCAP to MP4
     Export {

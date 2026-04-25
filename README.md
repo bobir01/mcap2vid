@@ -60,9 +60,15 @@ mcap2vid list -i recording.mcap
 
 # From S3-compatible storage
 mcap2vid list -i s3c://my-bucket/path/to/recording.mcap
+
+# Include exact schema and MCAP encoding details
+mcap2vid list -i recording.mcap --verbose
 ```
 
-Prints a table of available image topics, their schema type, and message count.
+Prints a table of available video topics, their detected type, and message count.
+Supported listing types include ROS2/CDR images and Foxglove protobuf
+`CompressedImage` / `CompressedVideo` topics. Use `--verbose` to inspect the
+exact schema name, schema encoding, and message encoding used for detection.
 
 ---
 
@@ -84,6 +90,9 @@ mcap2vid export -i recording.mcap -t /camera/image_raw -o - | ffplay -i pipe:0
 
 # Export directly from S3
 mcap2vid export -i s3c://my-bucket/path/recording.mcap -t /camera/image_raw -o output.mp4
+
+# Export Foxglove protobuf CompressedVideo (H.264)
+mcap2vid export -i recording.mcap -t /camera/h264 -o output.mp4
 ```
 
 **Export options:**
@@ -91,7 +100,7 @@ mcap2vid export -i s3c://my-bucket/path/recording.mcap -t /camera/image_raw -o o
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-i, --input` | _(required)_ | Local file path or `s3c://` URL |
-| `-t, --topic` | _(required)_ | ROS2 image topic (e.g. `/camera/image_raw`) |
+| `-t, --topic` | _(required)_ | Video topic (e.g. ROS2 image or Foxglove `CompressedVideo`) |
 | `-o, --output` | _(required)_ | Output `.mp4` path, or `-` for stdout |
 | `--suffix` | _(none)_ | Appended to output filename (e.g. `ego` → `name_ego.mp4`) |
 | `--preset` | `medium` | FFmpeg encoding preset (`ultrafast`, `fast`, `medium`, `slow`) |
@@ -99,6 +108,11 @@ mcap2vid export -i s3c://my-bucket/path/recording.mcap -t /camera/image_raw -o o
 | `--threads` | `0` (auto) | Parallel decode threads (0 = auto-detect) |
 
 > **Note:** Timestamps are embedded into the output MP4 in a custom `FTSS` atom. They are **not** embedded when streaming to stdout (`-o -`).
+
+Foxglove protobuf `CompressedVideo` export is packet-oriented: encoded packets
+are piped to FFmpeg instead of being decoded as still images by `mcap2vid`.
+H.264 (`h264`, `h.264`, `avc`, `avc1`) is supported and transcoded to H.264
+MP4 for robust output. FTSS timestamps use the per-message Foxglove timestamps.
 
 ---
 

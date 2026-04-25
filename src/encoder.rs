@@ -29,6 +29,35 @@ pub struct FfmpegEncoder {
     stderr_thread: Option<JoinHandle<()>>,
 }
 
+pub struct FfmpegPacketEncoder {
+    child: Child,
+    stdin_writer: Option<BufWriter<std::process::ChildStdin>>,
+    packets_written: usize,
+    stderr_buf: Arc<Mutex<Vec<u8>>>,
+    stderr_thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodedVideoCodec {
+    H264,
+}
+
+impl EncodedVideoCodec {
+    pub fn from_format(format: &str) -> Option<Self> {
+        let normalized = format.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "h264" | "h.264" | "avc" | "avc1" | "video/h264" | "video/avc" => Some(Self::H264),
+            _ => None,
+        }
+    }
+
+    fn ffmpeg_demuxer(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+        }
+    }
+}
+
 impl FfmpegEncoder {
     /// Start FFmpeg encoder process
     pub fn new<P: AsRef<Path>>(output_path: P, config: EncoderConfig) -> Result<Self> {
@@ -43,17 +72,28 @@ impl FfmpegEncoder {
         let mut cmd = Command::new("ffmpeg");
         cmd.args([
             "-y", // Overwrite output
-            "-f", "rawvideo",
-            "-pix_fmt", "rgb24",
-            "-s", &format!("{}x{}", config.width, config.height),
-            "-r", &format!("{}", config.fps),
-            "-i", "-", // Read from stdin
-            "-c:v", "libx264",
-            "-preset", &config.preset,
-            "-crf", &config.crf.to_string(),
-            "-pix_fmt", "yuv420p", // Required for compatibility
-            "-threads", &threads_arg,
-            "-movflags", "+faststart", // Enable streaming
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            &format!("{}x{}", config.width, config.height),
+            "-r",
+            &format!("{}", config.fps),
+            "-i",
+            "-", // Read from stdin
+            "-c:v",
+            "libx264",
+            "-preset",
+            &config.preset,
+            "-crf",
+            &config.crf.to_string(),
+            "-pix_fmt",
+            "yuv420p", // Required for compatibility
+            "-threads",
+            &threads_arg,
+            "-movflags",
+            "+faststart", // Enable streaming
         ]);
         cmd.arg(output_path.as_ref());
 
@@ -61,12 +101,9 @@ impl FfmpegEncoder {
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| {
-            anyhow!(
-                "Failed to start FFmpeg. Is it installed? Error: {}",
-                e
-            )
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow!("Failed to start FFmpeg. Is it installed? Error: {}", e))?;
 
         let stdin_writer = BufWriter::new(child.stdin.take().unwrap());
         let (stderr_buf, stderr_thread) = Self::spawn_stderr_drain(&mut child);
@@ -172,18 +209,30 @@ impl FfmpegEncoder {
         let mut cmd = Command::new("ffmpeg");
         cmd.args([
             "-y",
-            "-f", "rawvideo",
-            "-pix_fmt", "rgb24",
-            "-s", &format!("{}x{}", config.width, config.height),
-            "-r", &format!("{}", config.fps),
-            "-i", "-",
-            "-c:v", "libx264",
-            "-preset", &config.preset,
-            "-crf", &config.crf.to_string(),
-            "-pix_fmt", "yuv420p",
-            "-threads", &threads_arg,
-            "-f", "mp4",
-            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            &format!("{}x{}", config.width, config.height),
+            "-r",
+            &format!("{}", config.fps),
+            "-i",
+            "-",
+            "-c:v",
+            "libx264",
+            "-preset",
+            &config.preset,
+            "-crf",
+            &config.crf.to_string(),
+            "-pix_fmt",
+            "yuv420p",
+            "-threads",
+            &threads_arg,
+            "-f",
+            "mp4",
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof",
             "pipe:1",
         ]);
 
@@ -191,12 +240,9 @@ impl FfmpegEncoder {
         cmd.stdout(Stdio::inherit()); // FFmpeg stdout → process stdout (the video stream)
         cmd.stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| {
-            anyhow!(
-                "Failed to start FFmpeg. Is it installed? Error: {}",
-                e
-            )
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow!("Failed to start FFmpeg. Is it installed? Error: {}", e))?;
 
         let stdin_writer = BufWriter::new(child.stdin.take().unwrap());
         let (stderr_buf, stderr_thread) = Self::spawn_stderr_drain(&mut child);
@@ -229,6 +275,130 @@ impl FfmpegEncoder {
         if !status.success() {
             let stderr = self.get_stderr();
             return Err(anyhow!("FFmpeg encoding failed: {}", stderr));
+        }
+
+        Ok(())
+    }
+}
+
+impl FfmpegPacketEncoder {
+    pub fn new<P: AsRef<Path>>(
+        output_path: P,
+        codec: EncodedVideoCodec,
+        fps: f64,
+        config: &EncoderConfig,
+    ) -> Result<Self> {
+        let mut cmd = Self::base_command(codec, fps, config);
+        cmd.args(["-movflags", "+faststart"]);
+        cmd.arg(output_path.as_ref());
+        Self::spawn(cmd)
+    }
+
+    pub fn new_stdout(codec: EncodedVideoCodec, fps: f64, config: &EncoderConfig) -> Result<Self> {
+        let mut cmd = Self::base_command(codec, fps, config);
+        cmd.args([
+            "-f",
+            "mp4",
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof",
+            "pipe:1",
+        ]);
+        cmd.stdout(Stdio::inherit());
+        Self::spawn(cmd)
+    }
+
+    fn base_command(codec: EncodedVideoCodec, fps: f64, config: &EncoderConfig) -> Command {
+        let threads_arg = if config.threads == 0 {
+            "0".to_string()
+        } else {
+            config.threads.to_string()
+        };
+
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-y",
+            "-fflags",
+            "+genpts",
+            "-f",
+            codec.ffmpeg_demuxer(),
+            "-r",
+            &format!("{}", fps),
+            "-i",
+            "-",
+            "-c:v",
+            "libx264",
+            "-preset",
+            &config.preset,
+            "-crf",
+            &config.crf.to_string(),
+            "-pix_fmt",
+            "yuv420p",
+            "-threads",
+            &threads_arg,
+        ]);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::piped());
+        cmd
+    }
+
+    fn spawn(mut cmd: Command) -> Result<Self> {
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow!("Failed to start FFmpeg. Is it installed? Error: {}", e))?;
+
+        let stdin_writer = BufWriter::new(child.stdin.take().unwrap());
+        let (stderr_buf, stderr_thread) = FfmpegEncoder::spawn_stderr_drain(&mut child);
+
+        Ok(Self {
+            child,
+            stdin_writer: Some(stdin_writer),
+            packets_written: 0,
+            stderr_buf,
+            stderr_thread: Some(stderr_thread),
+        })
+    }
+
+    pub fn write_packet(&mut self, data: &[u8]) -> Result<()> {
+        let writer = self
+            .stdin_writer
+            .as_mut()
+            .ok_or_else(|| anyhow!("FFmpeg stdin not available"))?;
+
+        writer.write_all(data).map_err(|e| {
+            anyhow!(
+                "Failed to write video packet {} to FFmpeg: {}. FFmpeg stderr: {}",
+                self.packets_written,
+                e,
+                self.get_stderr()
+            )
+        })?;
+        self.packets_written += 1;
+        Ok(())
+    }
+
+    fn get_stderr(&self) -> String {
+        match self.stderr_buf.lock() {
+            Ok(buf) if !buf.is_empty() => String::from_utf8_lossy(&buf).to_string(),
+            _ => "No stderr available".to_string(),
+        }
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        if let Some(writer) = self.stdin_writer.take() {
+            drop(writer);
+        }
+
+        let status = self.child.wait()?;
+        if let Some(handle) = self.stderr_thread.take() {
+            let _ = handle.join();
+        }
+
+        if !status.success() {
+            return Err(anyhow!(
+                "FFmpeg packet export failed: {}",
+                self.get_stderr()
+            ));
         }
 
         Ok(())

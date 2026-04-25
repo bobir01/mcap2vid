@@ -5,11 +5,11 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Read;
 
+use crate::foxglove_proto;
 use crate::mcap_index::{self, McapSummary};
 use crate::mcap_reader::{FrameData, MetadataTopicInfo, TopicInfo, VideoFrame};
-use crate::ros2_msgs::{
-    parse_compressed_image, parse_image, ImageMessageType, MetadataMessageType,
-};
+use crate::ros2_msgs::{parse_compressed_image, parse_image};
+use crate::schema::{MetadataMessageKind, TopicSchema, VideoMessageKind};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -41,9 +41,7 @@ impl S3Url {
             .ok_or_else(|| anyhow!("Invalid S3 URL: must be s3c://bucket/key"))?;
 
         if bucket.is_empty() || key.is_empty() {
-            return Err(anyhow!(
-                "Invalid S3 URL: bucket and key must not be empty"
-            ));
+            return Err(anyhow!("Invalid S3 URL: bucket and key must not be empty"));
         }
 
         Ok(Self {
@@ -58,12 +56,12 @@ impl S3Client {
     ///
     /// Required: S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY
     pub fn from_env() -> Result<Self> {
-        let endpoint = std::env::var("S3_ENDPOINT")
-            .context("S3_ENDPOINT environment variable not set")?;
-        let access_key = std::env::var("S3_ACCESS_KEY")
-            .context("S3_ACCESS_KEY environment variable not set")?;
-        let secret_key = std::env::var("S3_SECRET_KEY")
-            .context("S3_SECRET_KEY environment variable not set")?;
+        let endpoint =
+            std::env::var("S3_ENDPOINT").context("S3_ENDPOINT environment variable not set")?;
+        let access_key =
+            std::env::var("S3_ACCESS_KEY").context("S3_ACCESS_KEY environment variable not set")?;
+        let secret_key =
+            std::env::var("S3_SECRET_KEY").context("S3_SECRET_KEY environment variable not set")?;
 
         Ok(Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
@@ -82,8 +80,16 @@ impl S3Client {
 
         let mut topics = Vec::new();
         for ch in &summary.channels {
-            let schema_name = schema_map.get(&ch.schema_id).copied().unwrap_or("");
-            let msg_type = ImageMessageType::from_schema_name(schema_name);
+            let schema = schema_map
+                .get(&ch.schema_id)
+                .cloned()
+                .unwrap_or_else(TopicSchema::default);
+            let topic_schema = TopicSchema::new(
+                schema.schema_name,
+                schema.schema_encoding,
+                &ch.message_encoding,
+            );
+            let msg_type = VideoMessageKind::from_topic_schema(&topic_schema);
             if msg_type.is_some() {
                 let count = summary
                     .channel_message_counts
@@ -92,7 +98,9 @@ impl S3Client {
                     .unwrap_or(0);
                 topics.push(TopicInfo {
                     name: ch.topic.clone(),
-                    schema_name: schema_name.to_string(),
+                    schema_name: topic_schema.schema_name,
+                    schema_encoding: topic_schema.schema_encoding,
+                    message_encoding: topic_schema.message_encoding,
                     message_count: count as usize,
                     message_type: msg_type,
                 });
@@ -109,8 +117,16 @@ impl S3Client {
 
         let mut topics = Vec::new();
         for ch in &summary.channels {
-            let schema_name = schema_map.get(&ch.schema_id).copied().unwrap_or("");
-            if let Some(msg_type) = MetadataMessageType::from_schema_name(schema_name) {
+            let schema = schema_map
+                .get(&ch.schema_id)
+                .cloned()
+                .unwrap_or_else(TopicSchema::default);
+            let topic_schema = TopicSchema::new(
+                schema.schema_name,
+                schema.schema_encoding,
+                &ch.message_encoding,
+            );
+            if let Some(msg_type) = MetadataMessageKind::from_topic_schema(&topic_schema) {
                 let count = summary
                     .channel_message_counts
                     .get(&ch.id)
@@ -118,7 +134,7 @@ impl S3Client {
                     .unwrap_or(0);
                 topics.push(MetadataTopicInfo {
                     name: ch.topic.clone(),
-                    schema_name: schema_name.to_string(),
+                    schema_name: topic_schema.schema_name,
                     message_count: count as usize,
                     message_type: msg_type,
                 });
@@ -151,20 +167,25 @@ impl S3Client {
         }
 
         // Determine message type
-        let ch = summary
-            .channels
-            .iter()
-            .find(|c| c.topic == topic)
-            .unwrap();
-        let schema_name = schema_map.get(&ch.schema_id).copied().unwrap_or("");
-        let message_type = ImageMessageType::from_schema_name(schema_name).ok_or_else(|| {
+        let ch = summary.channels.iter().find(|c| c.topic == topic).unwrap();
+        let schema = schema_map
+            .get(&ch.schema_id)
+            .cloned()
+            .unwrap_or_else(TopicSchema::default);
+        let topic_schema = TopicSchema::new(
+            schema.schema_name,
+            schema.schema_encoding,
+            &ch.message_encoding,
+        );
+        let message_type = VideoMessageKind::from_topic_schema(&topic_schema).ok_or_else(|| {
             anyhow!(
-                "Topic '{}' is not an image topic (schema: {})",
+                "Topic '{}' is not a supported video topic (schema: {}, schema encoding: {}, message encoding: {})",
                 topic,
-                schema_name
+                topic_schema.schema_name,
+                topic_schema.schema_encoding,
+                topic_schema.message_encoding
             )
         })?;
-
         // Find chunks containing the target channels
         let relevant_chunks: Vec<_> = summary
             .chunk_indexes
@@ -200,12 +221,11 @@ impl S3Client {
             let end = ci.chunk_start_offset + ci.chunk_length - 1;
             let chunk_data = self.get_object_range(s3_url, ci.chunk_start_offset, end)?;
 
-            let raw_msgs =
-                mcap_index::extract_messages_from_chunk(&chunk_data, &channel_ids)?;
+            let raw_msgs = mcap_index::extract_messages_from_chunk(&chunk_data, &channel_ids)?;
 
             for msg in raw_msgs {
                 let frame = match message_type {
-                    ImageMessageType::Image => {
+                    VideoMessageKind::Ros2Image => {
                         let img = parse_image(&msg.data)?;
                         VideoFrame {
                             timestamp: img.header.stamp.to_unix_timestamp(),
@@ -219,7 +239,7 @@ impl S3Client {
                             },
                         }
                     }
-                    ImageMessageType::CompressedImage => {
+                    VideoMessageKind::Ros2CompressedImage => {
                         let img = parse_compressed_image(&msg.data)?;
                         VideoFrame {
                             timestamp: img.header.stamp.to_unix_timestamp(),
@@ -227,6 +247,28 @@ impl S3Client {
                             data: FrameData::Compressed {
                                 format: img.format,
                                 data: img.data,
+                            },
+                        }
+                    }
+                    VideoMessageKind::FoxgloveCompressedImageProto => {
+                        let img = foxglove_proto::parse_compressed_image(&msg.data)?;
+                        VideoFrame {
+                            timestamp: img.header.stamp.to_unix_timestamp(),
+                            sequence,
+                            data: FrameData::Compressed {
+                                format: img.format,
+                                data: img.data,
+                            },
+                        }
+                    }
+                    VideoMessageKind::FoxgloveCompressedVideoProto => {
+                        let packet = foxglove_proto::parse_compressed_video(&msg.data)?;
+                        VideoFrame {
+                            timestamp: packet.timestamp.to_unix_timestamp(),
+                            sequence,
+                            data: FrameData::CompressedVideoPacket {
+                                format: packet.format,
+                                data: packet.data,
                             },
                         }
                     }
@@ -330,7 +372,10 @@ impl S3Client {
     fn read_summary(&self, s3_url: &S3Url) -> Result<McapSummary> {
         let file_size = self.head_object(s3_url)?;
         if file_size < mcap_index::footer_size() {
-            return Err(anyhow!("File too small to be a valid MCAP ({} bytes)", file_size));
+            return Err(anyhow!(
+                "File too small to be a valid MCAP ({} bytes)",
+                file_size
+            ));
         }
 
         // Read footer (last 37 bytes)
@@ -447,8 +492,7 @@ impl S3Client {
             payload_hash
         );
 
-        let credential_scope =
-            format!("{}/{}/s3/aws4_request", now.date_stamp, self.region);
+        let credential_scope = format!("{}/{}/s3/aws4_request", now.date_stamp, self.region);
         let string_to_sign = format!(
             "AWS4-HMAC-SHA256\n{}\n{}\n{}",
             now.amz_date,
@@ -467,10 +511,7 @@ impl S3Client {
         vec![
             ("Authorization".to_string(), authorization),
             ("x-amz-date".to_string(), now.amz_date.clone()),
-            (
-                "x-amz-content-sha256".to_string(),
-                payload_hash.to_string(),
-            ),
+            ("x-amz-content-sha256".to_string(), payload_hash.to_string()),
         ]
     }
 
@@ -493,11 +534,11 @@ pub fn is_s3_url(s: &str) -> bool {
 
 // ---- Internal helpers ----
 
-fn build_schema_map(summary: &McapSummary) -> HashMap<u16, &str> {
+fn build_schema_map(summary: &McapSummary) -> HashMap<u16, TopicSchema> {
     summary
         .schemas
         .iter()
-        .map(|s| (s.id, s.name.as_str()))
+        .map(|s| (s.id, TopicSchema::new(&s.name, &s.encoding, "")))
         .collect()
 }
 

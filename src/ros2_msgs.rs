@@ -43,44 +43,6 @@ pub struct CompressedImage {
     pub data: Vec<u8>,
 }
 
-/// Supported image message types
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ImageMessageType {
-    Image,
-    CompressedImage,
-}
-
-impl ImageMessageType {
-    pub fn from_schema_name(name: &str) -> Option<Self> {
-        if name.contains("CompressedImage") {
-            Some(ImageMessageType::CompressedImage)
-        } else if name.contains("Image") {
-            Some(ImageMessageType::Image)
-        } else {
-            None
-        }
-    }
-}
-
-/// Supported metadata message types
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MetadataMessageType {
-    CameraInfo,
-    TFMessage,
-}
-
-impl MetadataMessageType {
-    pub fn from_schema_name(name: &str) -> Option<Self> {
-        if name.contains("CameraInfo") {
-            Some(MetadataMessageType::CameraInfo)
-        } else if name.contains("TFMessage") {
-            Some(MetadataMessageType::TFMessage)
-        } else {
-            None
-        }
-    }
-}
-
 /// ROS2 sensor_msgs/RegionOfInterest
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RegionOfInterest {

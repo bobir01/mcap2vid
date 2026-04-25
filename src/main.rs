@@ -1,10 +1,12 @@
 mod cli;
 mod decoder;
 mod encoder;
+mod foxglove_proto;
 mod mcap_index;
 mod mcap_reader;
 mod ros2_msgs;
 mod s3_reader;
+mod schema;
 mod timestamp;
 
 use anyhow::Result;
@@ -15,8 +17,8 @@ use std::path::{Path, PathBuf};
 
 use cli::{Cli, Commands, MetadataAction};
 use decoder::{decode_frame, decode_frames_parallel, BadFrame, DecodeOutcome, DecodedFrame};
-use encoder::{EncoderConfig, FfmpegEncoder};
-use mcap_reader::{McapReader, VideoFrame};
+use encoder::{EncodedVideoCodec, EncoderConfig, FfmpegEncoder, FfmpegPacketEncoder};
+use mcap_reader::{FrameData, FrameScanInfo, McapReader, VideoFrame};
 use s3_reader::{is_s3_url, S3Client, S3Url};
 use timestamp::{embed_timestamps, read_timestamps};
 
@@ -27,7 +29,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::List { input } => list_topics(&input),
+        Commands::List { input, verbose } => list_topics(&input, verbose),
         Commands::Export {
             input,
             topic,
@@ -115,7 +117,7 @@ fn handle_metadata(action: MetadataAction) -> Result<()> {
     }
 }
 
-fn list_topics(input: &str) -> Result<()> {
+fn list_topics(input: &str, verbose: bool) -> Result<()> {
     let topics = if is_s3_url(input) {
         eprintln!("Reading index from: {}", input);
         let s3_url = S3Url::parse(input)?;
@@ -134,22 +136,37 @@ fn list_topics(input: &str) -> Result<()> {
 
     println!("\nAvailable video topics:");
     println!("{:-<80}", "");
-    println!(
-        "{:<50} {:<20} {:>8}",
-        "Topic", "Type", "Messages"
-    );
+    if verbose {
+        println!(
+            "{:<50} {:<28} {:<24} {:<12} {:<12} {:>8}",
+            "Topic", "Type", "Schema", "Schema Enc", "Msg Enc", "Messages"
+        );
+    } else {
+        println!("{:<50} {:<28} {:>8}", "Topic", "Type", "Messages");
+    }
     println!("{:-<80}", "");
 
     for topic in topics {
-        println!(
-            "{:<50} {:<20} {:>8}",
-            topic.name,
-            topic.schema_name
-                .split('/')
-                .last()
-                .unwrap_or(&topic.schema_name),
-            topic.message_count
-        );
+        let type_name = topic
+            .message_type
+            .map(|kind| kind.display_name())
+            .unwrap_or("Unknown");
+        if verbose {
+            println!(
+                "{:<50} {:<28} {:<24} {:<12} {:<12} {:>8}",
+                topic.name,
+                type_name,
+                topic.schema_name,
+                topic.schema_encoding,
+                topic.message_encoding,
+                topic.message_count
+            );
+        } else {
+            println!(
+                "{:<50} {:<28} {:>8}",
+                topic.name, type_name, topic.message_count
+            );
+        }
     }
 
     Ok(())
@@ -302,6 +319,12 @@ fn export_video(
             anyhow::bail!("No frames found for topic '{}'", topic);
         }
 
+        if matches!(&frames[0].data, FrameData::CompressedVideoPacket { .. }) {
+            return export_compressed_video_packets(
+                frames, output, suffix, threads, preset, crf, &log,
+            );
+        }
+
         let first_decoded = decode_frame(&frames[0])?;
         width = first_decoded.width;
         height = first_decoded.height;
@@ -341,6 +364,11 @@ fn export_video(
         };
 
         let first_frame = reader.extract_first_frame(topic)?;
+        if matches!(&first_frame.data, FrameData::CompressedVideoPacket { .. }) {
+            return export_compressed_video_local(
+                reader, topic, scan, output, suffix, threads, preset, crf, &log,
+            );
+        }
         let first_decoded = decode_frame(&first_frame)?;
         width = first_decoded.width;
         height = first_decoded.height;
@@ -519,6 +547,209 @@ fn export_video(
     Ok(())
 }
 
+fn output_path_for(output: &str, suffix: Option<&str>) -> Option<PathBuf> {
+    if output == "-" {
+        return None;
+    }
+
+    Some(if let Some(sfx) = suffix {
+        let p = PathBuf::from(output);
+        let stem = p.file_stem().unwrap_or_default().to_string_lossy();
+        let ext = p
+            .extension()
+            .map(|e| e.to_string_lossy())
+            .unwrap_or_default();
+        p.with_file_name(format!("{}_{}.{}", stem, sfx, ext))
+    } else {
+        PathBuf::from(output)
+    })
+}
+
+fn fps_from_count_and_range(count: usize, first_timestamp: f64, last_timestamp: f64) -> f64 {
+    if count >= 2 {
+        let duration_s = last_timestamp - first_timestamp;
+        if duration_s > 0.0 {
+            return ((count - 1) as f64 / duration_s).clamp(1.0, 120.0);
+        }
+    }
+    30.0
+}
+
+fn packet_codec_and_format(frame: &VideoFrame) -> Result<(EncodedVideoCodec, String)> {
+    match &frame.data {
+        FrameData::CompressedVideoPacket { format, .. } => {
+            let codec = EncodedVideoCodec::from_format(format).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unsupported foxglove.CompressedVideo format '{}'. Supported formats: h264",
+                    format
+                )
+            })?;
+            Ok((codec, format.clone()))
+        }
+        _ => anyhow::bail!("Expected foxglove.CompressedVideo packet"),
+    }
+}
+
+fn write_packet_frame(
+    encoder: &mut FfmpegPacketEncoder,
+    timestamps: &mut Vec<f64>,
+    expected_format: &str,
+    frame: &VideoFrame,
+) -> Result<()> {
+    match &frame.data {
+        FrameData::CompressedVideoPacket { format, data } => {
+            if !format.eq_ignore_ascii_case(expected_format) {
+                anyhow::bail!(
+                    "CompressedVideo format changed within topic: first '{}', later '{}'",
+                    expected_format,
+                    format
+                );
+            }
+            encoder.write_packet(data)?;
+            timestamps.push(frame.timestamp);
+            Ok(())
+        }
+        _ => anyhow::bail!("Mixed image and CompressedVideo messages in one export topic"),
+    }
+}
+
+fn finish_compressed_video_export(
+    encoder: FfmpegPacketEncoder,
+    timestamps: Vec<f64>,
+    total: usize,
+    output_path: Option<PathBuf>,
+) -> Result<()> {
+    encoder.finish()?;
+
+    let first_ts = timestamps.first().unwrap_or(&0.0);
+    let last_ts = timestamps.last().unwrap_or(&0.0);
+    let duration = last_ts - first_ts;
+
+    if let Some(path) = output_path {
+        eprintln!(
+            "Embedding {} message timestamps into MP4...",
+            timestamps.len()
+        );
+        embed_timestamps(&path, &timestamps)?;
+
+        println!("\nExport complete!");
+        println!("  Output: {}", path.display());
+        println!("  Duration: {:.2}s", duration);
+        println!("  Packets: {}", total);
+        println!("  Time range: {:.6} - {:.6}", first_ts, last_ts);
+        println!("\nTimestamps stored in FTSS atom using CompressedVideo message timestamps.");
+    } else {
+        eprintln!("\nExport complete!");
+        eprintln!("  Duration: {:.2}s", duration);
+        eprintln!("  Packets: {}", total);
+        eprintln!("  Time range: {:.6} - {:.6}", first_ts, last_ts);
+    }
+
+    Ok(())
+}
+
+fn export_compressed_video_packets(
+    frames: Vec<VideoFrame>,
+    output: &str,
+    suffix: Option<&str>,
+    threads: usize,
+    preset: &str,
+    crf: u8,
+    log: &Logger,
+) -> Result<()> {
+    let total = frames.len();
+    let fps = fps_from_count_and_range(
+        total,
+        frames.first().unwrap().timestamp,
+        frames.last().unwrap().timestamp,
+    );
+    let (codec, format) = packet_codec_and_format(frames.first().unwrap())?;
+    let output_path = output_path_for(output, suffix);
+
+    log.log(&format!(
+        "Foxglove CompressedVideo: format={} @ {:.2} FPS, {} packets",
+        format, fps, total
+    ));
+    log.log("Transcoding encoded packet stream to H.264 MP4 with FFmpeg");
+
+    let config = EncoderConfig {
+        width: 0,
+        height: 0,
+        fps,
+        preset: preset.to_string(),
+        crf,
+        threads,
+    };
+
+    let mut encoder = if let Some(path) = &output_path {
+        FfmpegPacketEncoder::new(path, codec, fps, &config)?
+    } else {
+        FfmpegPacketEncoder::new_stdout(codec, fps, &config)?
+    };
+
+    let pb = log.progress_bar(total as u64);
+    let mut timestamps = Vec::with_capacity(total);
+    for frame in &frames {
+        write_packet_frame(&mut encoder, &mut timestamps, &format, frame)?;
+        pb.inc(1);
+    }
+    pb.finish_with_message("Packet export complete");
+
+    finish_compressed_video_export(encoder, timestamps, total, output_path)
+}
+
+fn export_compressed_video_local(
+    reader: McapReader,
+    topic: &str,
+    scan: FrameScanInfo,
+    output: &str,
+    suffix: Option<&str>,
+    threads: usize,
+    preset: &str,
+    crf: u8,
+    log: &Logger,
+) -> Result<()> {
+    let fps = fps_from_count_and_range(scan.count, scan.first_timestamp, scan.last_timestamp);
+    let first_frame = reader.extract_first_frame(topic)?;
+    let (codec, format) = packet_codec_and_format(&first_frame)?;
+    let output_path = output_path_for(output, suffix);
+
+    log.log(&format!(
+        "Foxglove CompressedVideo: format={} @ {:.2} FPS, {} packets",
+        format, fps, scan.count
+    ));
+    log.log("Transcoding encoded packet stream to H.264 MP4 with FFmpeg");
+
+    let config = EncoderConfig {
+        width: 0,
+        height: 0,
+        fps,
+        preset: preset.to_string(),
+        crf,
+        threads,
+    };
+
+    let mut encoder = if let Some(path) = &output_path {
+        FfmpegPacketEncoder::new(path, codec, fps, &config)?
+    } else {
+        FfmpegPacketEncoder::new_stdout(codec, fps, &config)?
+    };
+
+    let pb = log.progress_bar(scan.count as u64);
+    let mut timestamps = Vec::with_capacity(scan.count);
+
+    reader.process_frames_batched(topic, BATCH_SIZE, |batch| {
+        for frame in batch {
+            write_packet_frame(&mut encoder, &mut timestamps, &format, frame)?;
+            pb.inc(1);
+        }
+        Ok(())
+    })?;
+    pb.finish_with_message("Packet export complete");
+
+    finish_compressed_video_export(encoder, timestamps, scan.count, output_path)
+}
+
 fn list_metadata_topics(input: &str) -> Result<()> {
     let topics = if is_s3_url(input) {
         eprintln!("Reading index from: {}", input);
@@ -538,17 +769,15 @@ fn list_metadata_topics(input: &str) -> Result<()> {
 
     println!("\nAvailable metadata topics:");
     println!("{:-<80}", "");
-    println!(
-        "{:<50} {:<20} {:>8}",
-        "Topic", "Type", "Messages"
-    );
+    println!("{:<50} {:<20} {:>8}", "Topic", "Type", "Messages");
     println!("{:-<80}", "");
 
     for topic in topics {
         println!(
             "{:<50} {:<20} {:>8}",
             topic.name,
-            topic.schema_name
+            topic
+                .schema_name
                 .split('/')
                 .last()
                 .unwrap_or(&topic.schema_name),
@@ -734,12 +963,7 @@ fn verify_timestamps(input: &Path, show_all: bool) -> Result<()> {
 
             for (i, &ts) in timestamps.iter().skip(start_idx).enumerate() {
                 let delta_ms = (ts - prev_ts) * 1000.0;
-                println!(
-                    "{:>8}  {:>20.6}  {:>20.3}",
-                    start_idx + i,
-                    ts,
-                    delta_ms
-                );
+                println!("{:>8}  {:>20.6}  {:>20.3}", start_idx + i, ts, delta_ms);
                 prev_ts = ts;
             }
         }

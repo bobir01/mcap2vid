@@ -4,18 +4,22 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
+use crate::foxglove_proto;
 use crate::ros2_msgs::{
     parse_camera_info, parse_compressed_image, parse_header_timestamp, parse_image,
-    parse_tf_message, CameraInfo, ImageMessageType, MetadataMessageType, TFMessage,
+    parse_tf_message, CameraInfo, TFMessage,
 };
+use crate::schema::{MetadataMessageKind, TopicSchema, VideoMessageKind};
 
 /// Information about a video topic in an MCAP file
 #[derive(Debug, Clone)]
 pub struct TopicInfo {
     pub name: String,
     pub schema_name: String,
+    pub schema_encoding: String,
+    pub message_encoding: String,
     pub message_count: usize,
-    pub message_type: Option<ImageMessageType>,
+    pub message_type: Option<VideoMessageKind>,
 }
 
 /// Information about a metadata topic in an MCAP file
@@ -24,7 +28,7 @@ pub struct MetadataTopicInfo {
     pub name: String,
     pub schema_name: String,
     pub message_count: usize,
-    pub message_type: MetadataMessageType,
+    pub message_type: MetadataMessageKind,
 }
 
 /// A video frame extracted from MCAP
@@ -49,6 +53,10 @@ pub enum FrameData {
         format: String,
         data: Vec<u8>,
     },
+    CompressedVideoPacket {
+        format: String,
+        data: Vec<u8>,
+    },
 }
 
 /// Frame count and timestamp range from a quick topic scan.
@@ -57,6 +65,14 @@ pub struct FrameScanInfo {
     pub count: usize,
     pub first_timestamp: f64,
     pub last_timestamp: f64,
+}
+
+fn topic_schema_from_channel(channel: &mcap::Channel<'_>) -> TopicSchema {
+    channel
+        .schema
+        .as_ref()
+        .map(|s| TopicSchema::new(&s.name, &s.encoding, &channel.message_encoding))
+        .unwrap_or_else(|| TopicSchema::new("", "", &channel.message_encoding))
 }
 
 /// Backing storage for MCAP data — either memory-mapped or in-memory
@@ -84,12 +100,16 @@ impl McapReader {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path.as_ref())?;
         let mmap = unsafe { Mmap::map(&file)? };
-        Ok(Self { data: McapData::Mmap(mmap) })
+        Ok(Self {
+            data: McapData::Mmap(mmap),
+        })
     }
 
     /// Create a reader from in-memory data (e.g., downloaded from S3)
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self { data: McapData::InMemory(bytes) }
+        Self {
+            data: McapData::InMemory(bytes),
+        }
     }
 
     /// List all topics that contain image data
@@ -97,7 +117,7 @@ impl McapReader {
         let mut topics = Vec::new();
         // Use topic name as key instead of channel id
         let mut topic_message_counts: HashMap<String, usize> = HashMap::new();
-        let mut topic_schema: HashMap<String, String> = HashMap::new();
+        let mut topic_schema: HashMap<String, TopicSchema> = HashMap::new();
 
         for record in mcap::MessageStream::new(self.data.as_ref())? {
             match record {
@@ -106,13 +126,21 @@ impl McapReader {
                     *topic_message_counts.entry(topic_name.clone()).or_insert(0) += 1;
 
                     if !topic_schema.contains_key(&topic_name) {
-                        let schema_name = msg
+                        let schema = msg
                             .channel
                             .schema
                             .as_ref()
-                            .map(|s| s.name.clone())
-                            .unwrap_or_default();
-                        topic_schema.insert(topic_name, schema_name);
+                            .map(|s| {
+                                TopicSchema::new(
+                                    &s.name,
+                                    &s.encoding,
+                                    &msg.channel.message_encoding,
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                TopicSchema::new("", "", &msg.channel.message_encoding)
+                            });
+                        topic_schema.insert(topic_name, schema);
                     }
                 }
                 Err(e) => {
@@ -121,12 +149,14 @@ impl McapReader {
             }
         }
 
-        for (topic_name, schema_name) in topic_schema {
-            let msg_type = ImageMessageType::from_schema_name(&schema_name);
+        for (topic_name, schema) in topic_schema {
+            let msg_type = VideoMessageKind::from_topic_schema(&schema);
             if msg_type.is_some() {
                 topics.push(TopicInfo {
                     name: topic_name.clone(),
-                    schema_name,
+                    schema_name: schema.schema_name,
+                    schema_encoding: schema.schema_encoding,
+                    message_encoding: schema.message_encoding,
                     message_count: *topic_message_counts.get(&topic_name).unwrap_or(&0),
                     message_type: msg_type,
                 });
@@ -141,7 +171,7 @@ impl McapReader {
     /// Extract all video frames from a specific topic
     pub fn extract_frames(&self, topic: &str) -> Result<Vec<VideoFrame>> {
         let mut frames = Vec::new();
-        let mut message_type: Option<ImageMessageType> = None;
+        let mut message_type: Option<VideoMessageKind> = None;
         let mut sequence = 0u64;
 
         for record in mcap::MessageStream::new(self.data.as_ref())? {
@@ -153,24 +183,21 @@ impl McapReader {
 
                     // Determine message type from schema on first message
                     if message_type.is_none() {
-                        let schema_name = msg
-                            .channel
-                            .schema
-                            .as_ref()
-                            .map(|s| s.name.as_str())
-                            .unwrap_or("");
-                        message_type = ImageMessageType::from_schema_name(schema_name);
+                        let schema = topic_schema_from_channel(&msg.channel);
+                        message_type = VideoMessageKind::from_topic_schema(&schema);
                         if message_type.is_none() {
                             return Err(anyhow!(
-                                "Topic '{}' does not contain image messages (schema: {})",
+                                "Topic '{}' does not contain supported video messages (schema: {}, schema encoding: {}, message encoding: {})",
                                 topic,
-                                schema_name
+                                schema.schema_name,
+                                schema.schema_encoding,
+                                schema.message_encoding
                             ));
                         }
                     }
 
                     let frame = match message_type.unwrap() {
-                        ImageMessageType::Image => {
+                        VideoMessageKind::Ros2Image => {
                             let img = parse_image(&msg.data)?;
                             VideoFrame {
                                 timestamp: img.header.stamp.to_unix_timestamp(),
@@ -184,7 +211,7 @@ impl McapReader {
                                 },
                             }
                         }
-                        ImageMessageType::CompressedImage => {
+                        VideoMessageKind::Ros2CompressedImage => {
                             let img = parse_compressed_image(&msg.data)?;
                             VideoFrame {
                                 timestamp: img.header.stamp.to_unix_timestamp(),
@@ -192,6 +219,28 @@ impl McapReader {
                                 data: FrameData::Compressed {
                                     format: img.format,
                                     data: img.data,
+                                },
+                            }
+                        }
+                        VideoMessageKind::FoxgloveCompressedImageProto => {
+                            let img = foxglove_proto::parse_compressed_image(&msg.data)?;
+                            VideoFrame {
+                                timestamp: img.header.stamp.to_unix_timestamp(),
+                                sequence,
+                                data: FrameData::Compressed {
+                                    format: img.format,
+                                    data: img.data,
+                                },
+                            }
+                        }
+                        VideoMessageKind::FoxgloveCompressedVideoProto => {
+                            let packet = foxglove_proto::parse_compressed_video(&msg.data)?;
+                            VideoFrame {
+                                timestamp: packet.timestamp.to_unix_timestamp(),
+                                sequence,
+                                data: FrameData::CompressedVideoPacket {
+                                    format: packet.format,
+                                    data: packet.data,
                                 },
                             }
                         }
@@ -231,24 +280,32 @@ impl McapReader {
                 }
 
                 if !schema_checked {
-                    let schema_name = msg
-                        .channel
-                        .schema
-                        .as_ref()
-                        .map(|s| s.name.as_str())
-                        .unwrap_or("");
-                    let is_image_topic = ImageMessageType::from_schema_name(schema_name).is_some();
-                    if !is_image_topic {
+                    let schema = topic_schema_from_channel(&msg.channel);
+                    let msg_type = VideoMessageKind::from_topic_schema(&schema);
+                    if msg_type.is_none() {
                         return Err(anyhow!(
-                            "Topic '{}' does not contain image messages (schema: {})",
+                            "Topic '{}' does not contain exportable video messages (schema: {}, schema encoding: {}, message encoding: {})",
                             topic,
-                            schema_name
+                            schema.schema_name,
+                            schema.schema_encoding,
+                            schema.message_encoding
                         ));
                     }
                     schema_checked = true;
                 }
 
-                let t = parse_header_timestamp(&msg.data)?;
+                let schema = topic_schema_from_channel(&msg.channel);
+                let t = match VideoMessageKind::from_topic_schema(&schema).unwrap() {
+                    VideoMessageKind::Ros2Image | VideoMessageKind::Ros2CompressedImage => {
+                        parse_header_timestamp(&msg.data)?
+                    }
+                    VideoMessageKind::FoxgloveCompressedImageProto => {
+                        foxglove_proto::parse_compressed_image_timestamp(&msg.data)?
+                    }
+                    VideoMessageKind::FoxgloveCompressedVideoProto => {
+                        foxglove_proto::parse_compressed_video_timestamp(&msg.data)?
+                    }
+                };
                 count += 1;
                 if t < first_ts {
                     first_ts = t;
@@ -278,17 +335,11 @@ impl McapReader {
                     continue;
                 }
 
-                let schema_name = msg
-                    .channel
-                    .schema
-                    .as_ref()
-                    .map(|s| s.name.as_str())
-                    .unwrap_or("");
-                let msg_type = ImageMessageType::from_schema_name(schema_name)
+                let schema = topic_schema_from_channel(&msg.channel);
+                let msg_type = VideoMessageKind::from_topic_schema(&schema)
                     .ok_or_else(|| anyhow!("Topic '{}' is not an image topic", topic))?;
-
                 return Ok(match msg_type {
-                    ImageMessageType::Image => {
+                    VideoMessageKind::Ros2Image => {
                         let img = parse_image(&msg.data)?;
                         VideoFrame {
                             timestamp: img.header.stamp.to_unix_timestamp(),
@@ -302,7 +353,7 @@ impl McapReader {
                             },
                         }
                     }
-                    ImageMessageType::CompressedImage => {
+                    VideoMessageKind::Ros2CompressedImage => {
                         let img = parse_compressed_image(&msg.data)?;
                         VideoFrame {
                             timestamp: img.header.stamp.to_unix_timestamp(),
@@ -310,6 +361,28 @@ impl McapReader {
                             data: FrameData::Compressed {
                                 format: img.format,
                                 data: img.data,
+                            },
+                        }
+                    }
+                    VideoMessageKind::FoxgloveCompressedImageProto => {
+                        let img = foxglove_proto::parse_compressed_image(&msg.data)?;
+                        VideoFrame {
+                            timestamp: img.header.stamp.to_unix_timestamp(),
+                            sequence: 0,
+                            data: FrameData::Compressed {
+                                format: img.format,
+                                data: img.data,
+                            },
+                        }
+                    }
+                    VideoMessageKind::FoxgloveCompressedVideoProto => {
+                        let packet = foxglove_proto::parse_compressed_video(&msg.data)?;
+                        VideoFrame {
+                            timestamp: packet.timestamp.to_unix_timestamp(),
+                            sequence: 0,
+                            data: FrameData::CompressedVideoPacket {
+                                format: packet.format,
+                                data: packet.data,
                             },
                         }
                     }
@@ -331,7 +404,7 @@ impl McapReader {
         F: FnMut(&[VideoFrame]) -> Result<()>,
     {
         let mut batch = Vec::with_capacity(batch_size);
-        let mut message_type: Option<ImageMessageType> = None;
+        let mut message_type: Option<VideoMessageKind> = None;
         let mut sequence = 0u64;
 
         for record in mcap::MessageStream::new(self.data.as_ref())? {
@@ -342,24 +415,21 @@ impl McapReader {
                     }
 
                     if message_type.is_none() {
-                        let schema_name = msg
-                            .channel
-                            .schema
-                            .as_ref()
-                            .map(|s| s.name.as_str())
-                            .unwrap_or("");
-                        message_type = ImageMessageType::from_schema_name(schema_name);
+                        let schema = topic_schema_from_channel(&msg.channel);
+                        message_type = VideoMessageKind::from_topic_schema(&schema);
                         if message_type.is_none() {
                             return Err(anyhow!(
-                                "Topic '{}' does not contain image messages (schema: {})",
+                                "Topic '{}' does not contain supported video messages (schema: {}, schema encoding: {}, message encoding: {})",
                                 topic,
-                                schema_name
+                                schema.schema_name,
+                                schema.schema_encoding,
+                                schema.message_encoding
                             ));
                         }
                     }
 
                     let frame = match message_type.unwrap() {
-                        ImageMessageType::Image => {
+                        VideoMessageKind::Ros2Image => {
                             let img = parse_image(&msg.data)?;
                             VideoFrame {
                                 timestamp: img.header.stamp.to_unix_timestamp(),
@@ -373,7 +443,7 @@ impl McapReader {
                                 },
                             }
                         }
-                        ImageMessageType::CompressedImage => {
+                        VideoMessageKind::Ros2CompressedImage => {
                             let img = parse_compressed_image(&msg.data)?;
                             VideoFrame {
                                 timestamp: img.header.stamp.to_unix_timestamp(),
@@ -381,6 +451,28 @@ impl McapReader {
                                 data: FrameData::Compressed {
                                     format: img.format,
                                     data: img.data,
+                                },
+                            }
+                        }
+                        VideoMessageKind::FoxgloveCompressedImageProto => {
+                            let img = foxglove_proto::parse_compressed_image(&msg.data)?;
+                            VideoFrame {
+                                timestamp: img.header.stamp.to_unix_timestamp(),
+                                sequence,
+                                data: FrameData::Compressed {
+                                    format: img.format,
+                                    data: img.data,
+                                },
+                            }
+                        }
+                        VideoMessageKind::FoxgloveCompressedVideoProto => {
+                            let packet = foxglove_proto::parse_compressed_video(&msg.data)?;
+                            VideoFrame {
+                                timestamp: packet.timestamp.to_unix_timestamp(),
+                                sequence,
+                                data: FrameData::CompressedVideoPacket {
+                                    format: packet.format,
+                                    data: packet.data,
                                 },
                             }
                         }
@@ -411,7 +503,7 @@ impl McapReader {
     pub fn list_metadata_topics(&self) -> Result<Vec<MetadataTopicInfo>> {
         let mut topics = Vec::new();
         let mut topic_message_counts: HashMap<String, usize> = HashMap::new();
-        let mut topic_schema: HashMap<String, String> = HashMap::new();
+        let mut topic_schema: HashMap<String, TopicSchema> = HashMap::new();
 
         for record in mcap::MessageStream::new(self.data.as_ref())? {
             match record {
@@ -420,13 +512,21 @@ impl McapReader {
                     *topic_message_counts.entry(topic_name.clone()).or_insert(0) += 1;
 
                     if !topic_schema.contains_key(&topic_name) {
-                        let schema_name = msg
+                        let schema = msg
                             .channel
                             .schema
                             .as_ref()
-                            .map(|s| s.name.clone())
-                            .unwrap_or_default();
-                        topic_schema.insert(topic_name, schema_name);
+                            .map(|s| {
+                                TopicSchema::new(
+                                    &s.name,
+                                    &s.encoding,
+                                    &msg.channel.message_encoding,
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                TopicSchema::new("", "", &msg.channel.message_encoding)
+                            });
+                        topic_schema.insert(topic_name, schema);
                     }
                 }
                 Err(e) => {
@@ -435,11 +535,11 @@ impl McapReader {
             }
         }
 
-        for (topic_name, schema_name) in topic_schema {
-            if let Some(msg_type) = MetadataMessageType::from_schema_name(&schema_name) {
+        for (topic_name, schema) in topic_schema {
+            if let Some(msg_type) = MetadataMessageKind::from_topic_schema(&schema) {
                 topics.push(MetadataTopicInfo {
                     name: topic_name.clone(),
-                    schema_name,
+                    schema_name: schema.schema_name,
                     message_count: *topic_message_counts.get(&topic_name).unwrap_or(&0),
                     message_type: msg_type,
                 });
@@ -476,7 +576,10 @@ impl McapReader {
         }
 
         if messages.is_empty() {
-            return Err(anyhow!("No CameraInfo messages found for topic '{}'", topic));
+            return Err(anyhow!(
+                "No CameraInfo messages found for topic '{}'",
+                topic
+            ));
         }
 
         Ok(messages)

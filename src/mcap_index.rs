@@ -30,11 +30,13 @@ pub struct ChannelInfo {
     pub id: u16,
     pub schema_id: u16,
     pub topic: String,
+    pub message_encoding: String,
 }
 
 pub struct SchemaInfo {
     pub id: u16,
     pub name: String,
+    pub encoding: String,
 }
 
 pub struct ChunkIndexInfo {
@@ -105,8 +107,7 @@ pub fn parse_summary(data: &[u8]) -> Result<McapSummary> {
 
     while pos + 9 <= data.len() {
         let opcode = data[pos];
-        let content_len =
-            u64::from_le_bytes(data[pos + 1..pos + 9].try_into().unwrap()) as usize;
+        let content_len = u64::from_le_bytes(data[pos + 1..pos + 9].try_into().unwrap()) as usize;
         pos += 9;
 
         if pos + content_len > data.len() {
@@ -208,10 +209,7 @@ pub fn extract_messages_from_chunk(
     };
 
     // Parse message records from decompressed data
-    Ok(extract_messages_from_records(
-        &decompressed,
-        channel_filter,
-    ))
+    Ok(extract_messages_from_records(&decompressed, channel_filter))
 }
 
 // ---- Internal parsing helpers ----
@@ -220,8 +218,9 @@ fn parse_schema_record(data: &[u8]) -> Result<SchemaInfo> {
     let mut cursor = Cursor::new(data);
     let id = cursor.read_u16::<LittleEndian>()?;
     let name = read_mcap_string(&mut cursor)?;
-    // skip encoding + data fields — we only need id and name
-    Ok(SchemaInfo { id, name })
+    let encoding = read_mcap_string(&mut cursor)?;
+    // skip schema data field
+    Ok(SchemaInfo { id, name, encoding })
 }
 
 fn parse_channel_record(data: &[u8]) -> Result<ChannelInfo> {
@@ -229,11 +228,13 @@ fn parse_channel_record(data: &[u8]) -> Result<ChannelInfo> {
     let id = cursor.read_u16::<LittleEndian>()?;
     let schema_id = cursor.read_u16::<LittleEndian>()?;
     let topic = read_mcap_string(&mut cursor)?;
-    // skip message_encoding + metadata — we only need id, schema_id, topic
+    let message_encoding = read_mcap_string(&mut cursor)?;
+    // skip metadata
     Ok(ChannelInfo {
         id,
         schema_id,
         topic,
+        message_encoding,
     })
 }
 
@@ -314,11 +315,8 @@ fn extract_messages_from_records(data: &[u8], channel_filter: &[u16]) -> Vec<Raw
 
     while pos + 9 <= data.len() {
         let opcode = data[pos];
-        let content_len = u64::from_le_bytes(
-            data[pos + 1..pos + 9]
-                .try_into()
-                .unwrap_or([0u8; 8]),
-        ) as usize;
+        let content_len =
+            u64::from_le_bytes(data[pos + 1..pos + 9].try_into().unwrap_or([0u8; 8])) as usize;
         pos += 9;
 
         if pos + content_len > data.len() {
@@ -331,9 +329,7 @@ fn extract_messages_from_records(data: &[u8], channel_filter: &[u16]) -> Vec<Raw
             let ch_id = u16::from_le_bytes([data[pos], data[pos + 1]]);
 
             if channel_filter.contains(&ch_id) {
-                let log_time = u64::from_le_bytes(
-                    data[pos + 6..pos + 14].try_into().unwrap(),
-                );
+                let log_time = u64::from_le_bytes(data[pos + 6..pos + 14].try_into().unwrap());
                 let payload = data[pos + 22..pos + content_len].to_vec();
 
                 messages.push(RawMessage {
