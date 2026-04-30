@@ -40,6 +40,7 @@ pub struct FfmpegPacketEncoder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodedVideoCodec {
     H264,
+    H265,
 }
 
 impl EncodedVideoCodec {
@@ -47,6 +48,9 @@ impl EncodedVideoCodec {
         let normalized = format.trim().to_ascii_lowercase();
         match normalized.as_str() {
             "h264" | "h.264" | "avc" | "avc1" | "video/h264" | "video/avc" => Some(Self::H264),
+            "h265" | "h.265" | "hevc" | "hvc1" | "hev1" | "video/h265" | "video/hevc" => {
+                Some(Self::H265)
+            }
             _ => None,
         }
     }
@@ -54,6 +58,7 @@ impl EncodedVideoCodec {
     fn ffmpeg_demuxer(self) -> &'static str {
         match self {
             Self::H264 => "h264",
+            Self::H265 => "hevc",
         }
     }
 }
@@ -499,4 +504,30 @@ pub fn validate_frame_dimensions(frames: &[DecodedFrame]) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::EncodedVideoCodec;
+
+    #[test]
+    fn recognizes_h264_variants() {
+        for s in ["h264", "H264", "h.264", "avc", "avc1", "video/h264", "video/avc", "  h264 "] {
+            assert_eq!(EncodedVideoCodec::from_format(s), Some(EncodedVideoCodec::H264), "input: {s:?}");
+        }
+    }
+
+    #[test]
+    fn recognizes_h265_variants() {
+        for s in ["h265", "H265", "h.265", "hevc", "HEVC", "hvc1", "hev1", "video/h265", "video/hevc", "  hevc "] {
+            assert_eq!(EncodedVideoCodec::from_format(s), Some(EncodedVideoCodec::H265), "input: {s:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_format() {
+        for s in ["", "vp9", "av1", "mjpeg", "h266"] {
+            assert_eq!(EncodedVideoCodec::from_format(s), None, "input: {s:?}");
+        }
+    }
 }

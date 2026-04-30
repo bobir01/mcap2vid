@@ -111,8 +111,9 @@ mcap2vid export -i recording.mcap -t /camera/h264 -o output.mp4
 
 Foxglove protobuf `CompressedVideo` export is packet-oriented: encoded packets
 are piped to FFmpeg instead of being decoded as still images by `mcap2vid`.
-H.264 (`h264`, `h.264`, `avc`, `avc1`) is supported and transcoded to H.264
-MP4 for robust output. FTSS timestamps use the per-message Foxglove timestamps.
+H.264 (`h264`, `h.264`, `avc`, `avc1`) and H.265 / HEVC (`h265`, `h.265`,
+`hevc`, `hvc1`, `hev1`) are supported and transcoded to H.264 MP4 for robust
+output. FTSS timestamps use the per-message Foxglove timestamps.
 
 ---
 

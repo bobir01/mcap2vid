@@ -591,7 +591,7 @@ fn packet_codec_and_format(frame: &VideoFrame) -> Result<(EncodedVideoCodec, Str
         FrameData::CompressedVideoPacket { format, .. } => {
             let codec = EncodedVideoCodec::from_format(format).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Unsupported foxglove.CompressedVideo format '{}'. Supported formats: h264",
+                    "Unsupported foxglove.CompressedVideo format '{}'. Supported formats: h264, h265",
                     format
                 )
             })?;
