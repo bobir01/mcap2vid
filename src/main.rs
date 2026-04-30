@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use cli::{Cli, Commands, MetadataAction};
 use decoder::{decode_frame, decode_frames_parallel, BadFrame, DecodeOutcome, DecodedFrame};
-use encoder::{EncodedVideoCodec, EncoderConfig, FfmpegEncoder, FfmpegPacketEncoder};
+use encoder::{compress_mp4, EncodedVideoCodec, EncoderConfig, FfmpegEncoder, FfmpegPacketEncoder};
 use mcap_reader::{FrameData, FrameScanInfo, McapReader, VideoFrame};
 use s3_reader::{is_s3_url, S3Client, S3Url};
 use timestamp::{embed_timestamps, read_timestamps};
@@ -40,6 +40,7 @@ fn main() -> Result<()> {
             crf,
             max_bad_frames,
             max_bad_frames_pct,
+            compress,
         } => export_video(
             &input,
             &topic,
@@ -50,6 +51,7 @@ fn main() -> Result<()> {
             crf,
             max_bad_frames,
             max_bad_frames_pct,
+            compress,
         ),
         Commands::Verify { input, all } => verify_timestamps(&input, all),
         Commands::Metadata { action } => handle_metadata(action),
@@ -274,6 +276,7 @@ fn export_video(
     crf: u8,
     max_bad_frames: usize,
     max_bad_frames_pct: f64,
+    compress: bool,
 ) -> Result<()> {
     if !max_bad_frames_pct.is_finite() || max_bad_frames_pct < 0.0 || max_bad_frames_pct > 100.0 {
         anyhow::bail!(
@@ -282,6 +285,9 @@ fn export_video(
         );
     }
     let to_stdout = output == "-";
+    if compress && to_stdout {
+        anyhow::bail!("--compress cannot be used with stdout output (-o -)");
+    }
     let log = Logger {
         to_stderr: to_stdout,
     };
@@ -321,7 +327,7 @@ fn export_video(
 
         if matches!(&frames[0].data, FrameData::CompressedVideoPacket { .. }) {
             return export_compressed_video_packets(
-                frames, output, suffix, threads, preset, crf, &log,
+                frames, output, suffix, threads, preset, crf, compress, &log,
             );
         }
 
@@ -366,7 +372,7 @@ fn export_video(
         let first_frame = reader.extract_first_frame(topic)?;
         if matches!(&first_frame.data, FrameData::CompressedVideoPacket { .. }) {
             return export_compressed_video_local(
-                reader, topic, scan, output, suffix, threads, preset, crf, &log,
+                reader, topic, scan, output, suffix, threads, preset, crf, compress, &log,
             );
         }
         let first_decoded = decode_frame(&first_frame)?;
@@ -530,6 +536,11 @@ fn export_video(
     } else {
         let output_path = output_path.unwrap();
 
+        if compress {
+            log.log("Compressing output (libx264 CRF 23, yuv420p, no audio)...");
+            compress_mp4(&output_path)?;
+        }
+
         log.log(&format!(
             "Embedding {} timestamps into MP4...",
             timestamps.len()
@@ -618,6 +629,7 @@ fn finish_compressed_video_export(
     timestamps: Vec<f64>,
     total: usize,
     output_path: Option<PathBuf>,
+    compress: bool,
 ) -> Result<()> {
     encoder.finish()?;
 
@@ -626,6 +638,11 @@ fn finish_compressed_video_export(
     let duration = last_ts - first_ts;
 
     if let Some(path) = output_path {
+        if compress {
+            eprintln!("Compressing output (libx264 CRF 23, yuv420p, no audio)...");
+            compress_mp4(&path)?;
+        }
+
         eprintln!(
             "Embedding {} message timestamps into MP4...",
             timestamps.len()
@@ -655,8 +672,12 @@ fn export_compressed_video_packets(
     threads: usize,
     preset: &str,
     crf: u8,
+    compress: bool,
     log: &Logger,
 ) -> Result<()> {
+    if compress && output == "-" {
+        anyhow::bail!("--compress cannot be used with stdout output (-o -)");
+    }
     let total = frames.len();
     let fps = fps_from_count_and_range(
         total,
@@ -695,7 +716,7 @@ fn export_compressed_video_packets(
     }
     pb.finish_with_message("Packet export complete");
 
-    finish_compressed_video_export(encoder, timestamps, total, output_path)
+    finish_compressed_video_export(encoder, timestamps, total, output_path, compress)
 }
 
 fn export_compressed_video_local(
@@ -707,8 +728,12 @@ fn export_compressed_video_local(
     threads: usize,
     preset: &str,
     crf: u8,
+    compress: bool,
     log: &Logger,
 ) -> Result<()> {
+    if compress && output == "-" {
+        anyhow::bail!("--compress cannot be used with stdout output (-o -)");
+    }
     let fps = fps_from_count_and_range(scan.count, scan.first_timestamp, scan.last_timestamp);
     let first_frame = reader.extract_first_frame(topic)?;
     let (codec, format) = packet_codec_and_format(&first_frame)?;
@@ -747,7 +772,7 @@ fn export_compressed_video_local(
     })?;
     pb.finish_with_message("Packet export complete");
 
-    finish_compressed_video_export(encoder, timestamps, scan.count, output_path)
+    finish_compressed_video_export(encoder, timestamps, scan.count, output_path, compress)
 }
 
 fn list_metadata_topics(input: &str) -> Result<()> {
