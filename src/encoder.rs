@@ -405,6 +405,42 @@ impl FfmpegPacketEncoder {
     }
 }
 
+/// Re-encode an MP4 in place with libx264 CRF 23 (yuv420p, no audio) to
+/// shrink file size. Equivalent to:
+///   ffmpeg -y -i <path> -c:v libx264 -crf 23 -pix_fmt yuv420p -an <path>
+///
+/// Writes to a sibling temp file and renames over the original on success
+/// so a failed compression leaves the original untouched.
+pub fn compress_mp4<P: AsRef<Path>>(path: P) -> Result<()> {
+    let path = path.as_ref();
+    let temp_path = path.with_extension("compress.tmp.mp4");
+
+    let output = Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-i")
+        .arg(path)
+        .args([
+            "-c:v", "libx264", "-crf", "23", "-pix_fmt", "yuv420p", "-an",
+        ])
+        .arg(&temp_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| anyhow!("Failed to start FFmpeg for compression. Is it installed? Error: {}", e))?;
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&temp_path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("FFmpeg compression failed: {}", stderr));
+    }
+
+    std::fs::rename(&temp_path, path)
+        .map_err(|e| anyhow!("Failed to replace '{}' with compressed output: {}", path.display(), e))?;
+
+    Ok(())
+}
+
 /// Calculate appropriate FPS from frame timestamps
 pub fn calculate_fps(frames: &[DecodedFrame]) -> f64 {
     if frames.len() < 2 {

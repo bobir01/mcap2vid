@@ -63,6 +63,11 @@ pub enum Commands {
         /// the export aborts with a non-zero exit code.
         #[arg(long, default_value = "1.0")]
         max_bad_frames_pct: f64,
+
+        /// Re-encode the finished MP4 with libx264 CRF 23 (yuv420p, no audio)
+        /// to shrink file size. Incompatible with stdout output.
+        #[arg(long)]
+        compress: bool,
     },
     /// Verify and read embedded timestamps from an MP4 file
     Verify {
