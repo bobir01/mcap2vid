@@ -326,9 +326,7 @@ fn export_video(
         }
 
         if matches!(&frames[0].data, FrameData::CompressedVideoPacket { .. }) {
-            return export_compressed_video_packets(
-                frames, output, suffix, threads, preset, crf, compress, &log,
-            );
+            return export_compressed_video_packets(frames, output, suffix, compress, &log);
         }
 
         let first_decoded = decode_frame(&frames[0])?;
@@ -372,7 +370,7 @@ fn export_video(
         let first_frame = reader.extract_first_frame(topic)?;
         if matches!(&first_frame.data, FrameData::CompressedVideoPacket { .. }) {
             return export_compressed_video_local(
-                reader, topic, scan, output, suffix, threads, preset, crf, compress, &log,
+                reader, topic, scan, output, suffix, compress, &log,
             );
         }
         let first_decoded = decode_frame(&first_frame)?;
@@ -669,9 +667,6 @@ fn export_compressed_video_packets(
     frames: Vec<VideoFrame>,
     output: &str,
     suffix: Option<&str>,
-    threads: usize,
-    preset: &str,
-    crf: u8,
     compress: bool,
     log: &Logger,
 ) -> Result<()> {
@@ -691,21 +686,12 @@ fn export_compressed_video_packets(
         "Foxglove CompressedVideo: format={} @ {:.2} FPS, {} packets",
         format, fps, total
     ));
-    log.log("Transcoding encoded packet stream to H.264 MP4 with FFmpeg");
-
-    let config = EncoderConfig {
-        width: 0,
-        height: 0,
-        fps,
-        preset: preset.to_string(),
-        crf,
-        threads,
-    };
+    log.log("Remuxing encoded packets into MP4 (preserving source codec)");
 
     let mut encoder = if let Some(path) = &output_path {
-        FfmpegPacketEncoder::new(path, codec, fps, &config)?
+        FfmpegPacketEncoder::new(path, codec, fps)?
     } else {
-        FfmpegPacketEncoder::new_stdout(codec, fps, &config)?
+        FfmpegPacketEncoder::new_stdout(codec, fps)?
     };
 
     let pb = log.progress_bar(total as u64);
@@ -725,9 +711,6 @@ fn export_compressed_video_local(
     scan: FrameScanInfo,
     output: &str,
     suffix: Option<&str>,
-    threads: usize,
-    preset: &str,
-    crf: u8,
     compress: bool,
     log: &Logger,
 ) -> Result<()> {
@@ -743,21 +726,12 @@ fn export_compressed_video_local(
         "Foxglove CompressedVideo: format={} @ {:.2} FPS, {} packets",
         format, fps, scan.count
     ));
-    log.log("Transcoding encoded packet stream to H.264 MP4 with FFmpeg");
-
-    let config = EncoderConfig {
-        width: 0,
-        height: 0,
-        fps,
-        preset: preset.to_string(),
-        crf,
-        threads,
-    };
+    log.log("Remuxing encoded packets into MP4 (preserving source codec)");
 
     let mut encoder = if let Some(path) = &output_path {
-        FfmpegPacketEncoder::new(path, codec, fps, &config)?
+        FfmpegPacketEncoder::new(path, codec, fps)?
     } else {
-        FfmpegPacketEncoder::new_stdout(codec, fps, &config)?
+        FfmpegPacketEncoder::new_stdout(codec, fps)?
     };
 
     let pb = log.progress_bar(scan.count as u64);
