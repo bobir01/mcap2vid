@@ -291,16 +291,15 @@ impl FfmpegPacketEncoder {
         output_path: P,
         codec: EncodedVideoCodec,
         fps: f64,
-        config: &EncoderConfig,
     ) -> Result<Self> {
-        let mut cmd = Self::base_command(codec, fps, config);
+        let mut cmd = Self::base_command(codec, fps);
         cmd.args(["-movflags", "+faststart"]);
         cmd.arg(output_path.as_ref());
         Self::spawn(cmd)
     }
 
-    pub fn new_stdout(codec: EncodedVideoCodec, fps: f64, config: &EncoderConfig) -> Result<Self> {
-        let mut cmd = Self::base_command(codec, fps, config);
+    pub fn new_stdout(codec: EncodedVideoCodec, fps: f64) -> Result<Self> {
+        let mut cmd = Self::base_command(codec, fps);
         cmd.args([
             "-f",
             "mp4",
@@ -312,13 +311,11 @@ impl FfmpegPacketEncoder {
         Self::spawn(cmd)
     }
 
-    fn base_command(codec: EncodedVideoCodec, fps: f64, config: &EncoderConfig) -> Command {
-        let threads_arg = if config.threads == 0 {
-            "0".to_string()
-        } else {
-            config.threads.to_string()
-        };
-
+    /// Build an ffmpeg command that remuxes encoded packets into MP4
+    /// without re-encoding. The source codec is preserved verbatim;
+    /// `--compress` runs a separate libx264 pass afterwards if the user
+    /// wants to shrink / convert to H.264.
+    fn base_command(codec: EncodedVideoCodec, fps: f64) -> Command {
         let mut cmd = Command::new("ffmpeg");
         cmd.args([
             "-y",
@@ -331,16 +328,16 @@ impl FfmpegPacketEncoder {
             "-i",
             "-",
             "-c:v",
-            "libx264",
-            "-preset",
-            &config.preset,
-            "-crf",
-            &config.crf.to_string(),
-            "-pix_fmt",
-            "yuv420p",
-            "-threads",
-            &threads_arg,
+            "copy",
+            "-an",
         ]);
+
+        // Apple compatibility: QuickTime / Safari only play H.265 MP4s when
+        // the codec tag is hvc1 (the default `hev1` is rejected).
+        if codec == EncodedVideoCodec::H265 {
+            cmd.args(["-tag:v", "hvc1"]);
+        }
+
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
